@@ -46,6 +46,15 @@ html,body{height:100%;background:var(--bg);color:var(--text);
 
 #app{display:flex;flex-direction:column;height:100vh;height:100dvh}
 
+/* APP HEADER (permanent, all pages) */
+#app-header{
+  display:flex;align-items:baseline;gap:8px;
+  background:var(--bg2);border-bottom:1px solid #2a2a2a;
+  padding:7px 14px;flex-shrink:0;
+}
+#app-title{font-size:14px;font-weight:800;letter-spacing:.3px;color:var(--text)}
+#app-version{font-size:11px;font-weight:600;color:var(--text2);letter-spacing:.5px}
+
 /* TAB BAR */
 #tab-bar{
   display:flex;background:var(--bg2);
@@ -89,16 +98,17 @@ html,body{height:100%;background:var(--bg);color:var(--text);
   100%{transform:scale(1);opacity:1}
 }
 
-/* Green crop box — shows exactly the center 60% region sent to OCR */
+/* Green crop box — shows exactly the region sent to OCR
+   (center 60% horizontally, center 50% vertically). */
 #crop-box{
-  position:absolute;top:20%;left:20%;width:60%;height:60%;
+  position:absolute;top:25%;left:20%;width:60%;height:50%;
   border:2px solid var(--green);
   background:rgba(34,197,94,.07);
   border-radius:8px;
   box-shadow:0 0 0 100vmax rgba(0,0,0,.22);
 }
 #crop-box::before{
-  content:'Position plate inside the box';
+  content:'Aim plate here';
   position:absolute;top:-26px;left:0;right:0;text-align:center;
   font-size:11px;font-weight:700;letter-spacing:.6px;
   color:rgba(255,255,255,.85);text-shadow:0 1px 3px rgba(0,0,0,.8);
@@ -134,6 +144,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);
 }
 .ocr-line{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ocr-line.ok{color:var(--green)}
+.ocr-reason{color:rgba(255,176,72,.85)}
 
 #last-detected{
   background:rgba(0,0,0,.8);
@@ -343,6 +354,13 @@ html,body{height:100%;background:var(--bg);color:var(--text);
 <body>
 
 <div id="app">
+
+  <!-- PERMANENT HEADER (version label lives here) -->
+  <div id="app-header">
+    <span id="app-title">Plate Tracker</span>
+    <span id="app-version">v0.02</span>
+  </div>
+
   <div id="pages">
 
     <!-- SCAN -->
@@ -359,7 +377,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);
             <div id="last-detected-label">Last Detected</div>
             <div id="last-detected-plate">—</div>
           </div>
-          <button id="capture-btn">📸 Capture Now</button>
+          <button id="capture-btn">📸 Scan Now</button>
           <div id="ocr-log">
             <div id="ocr-log-title">Recent OCR reads</div>
             <div id="ocr-log-lines"></div>
@@ -671,15 +689,27 @@ const ocrLogLinesEl = document.getElementById('ocr-log-lines');
 
 let cameraReady = false;
 
-// Running log of the last 5 raw OCR reads (incl. rejected) for debugging
+// Running log of the last 5 raw OCR reads (incl. rejected) for debugging.
+// Rejected reads also show exactly what Tesseract returned and WHY it was
+// rejected (too short, too long, no letters, nothing readable).
 const ocrLog = [];
-function pushOcrLog(rawText, accepted) {
-  const clean = ((rawText || '').replace(/\s+/g, ' ').trim() || '(nothing)')
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  ocrLog.unshift({ text: clean, accepted });
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function pushOcrLog(rawText, acceptedPlate, reason) {
+  let entry;
+  if (acceptedPlate) {
+    entry = { text: escapeHtml(acceptedPlate), accepted: true, note: '' };
+  } else {
+    const clean = escapeHtml((rawText || '').replace(/\s+/g, ' ').trim() || '(nothing)');
+    entry = { text: clean, accepted: false, note: reason || 'rejected' };
+  }
+  ocrLog.unshift(entry);
   if (ocrLog.length > 5) ocrLog.length = 5;
   ocrLogLinesEl.innerHTML = ocrLog.map(e =>
-    `<div class="ocr-line${e.accepted ? ' ok' : ''}">${e.accepted ? '✓ ' : '· '}${e.text}</div>`
+    e.accepted
+      ? `<div class="ocr-line ok">✓ ${e.text}</div>`
+      : `<div class="ocr-line">· ${e.text}<span class="ocr-reason"> — ${e.note}</span></div>`
   ).join('');
 }
 
@@ -723,10 +753,14 @@ let scanInterval = null;
 function cleanPlate(raw) {
   return raw.replace(/[^A-Z0-9]/g, '').toUpperCase();
 }
-function isValidPlate(text) {
-  // 3–9 chars, must contain at least one letter (letter-only plates allowed)
-  if (text.length < 3 || text.length > 9) return false;
-  return /[A-Z]/.test(text);
+// Relaxed validation: 3–9 chars, must contain at least one letter (no number
+// required, letter-only plates allowed). Returns the rejection reason so the
+// debug log can show why a read was thrown out.
+function validatePlate(text) {
+  if (text.length < 3) return { valid: false, reason: 'too short' };
+  if (text.length > 9) return { valid: false, reason: 'too long' };
+  if (!/[A-Z]/.test(text)) return { valid: false, reason: 'no letters' };
+  return { valid: true, reason: '' };
 }
 
 async function initOCR() {
@@ -797,9 +831,10 @@ async function scanFrame() {
   try {
     const vw = videoEl.videoWidth;
     const vh = videoEl.videoHeight;
-    // Crop to the center 60% of the frame (matches the green crop box overlay)
-    const sx = vw * 0.20, sy = vh * 0.20;
-    const sw = vw * 0.60, sh = vh * 0.60;
+    // Crop to the center 60% horizontally and center 50% vertically
+    // (matches the green "Aim plate here" crop box overlay).
+    const sx = vw * 0.20, sy = vh * 0.25;
+    const sw = vw * 0.60, sh = vh * 0.50;
     // Downscale for speed
     const scale = Math.min(1, 700 / sw);
     const cw = Math.round(sw * scale);
@@ -812,22 +847,27 @@ async function scanFrame() {
     preprocessCanvas(ctx, cw, ch);
 
     const { data: { text } } = await tessWorker.recognize(captureCanvas);
-    pushOcrLog(text, false);
 
-    // Try multi-word: split by whitespace, check each chunk
-    const chunks = text.split(/\s+/);
+    // Build candidates: each whitespace-separated chunk plus the whole string,
+    // cleaned to A–Z0–9. Accept the first one that passes validation.
+    const chunks = text.split(/\s+/).map(cleanPlate).filter(Boolean);
+    const whole = cleanPlate(text);
     let matched = null;
-    for (const chunk of chunks) {
-      const plate = cleanPlate(chunk);
-      if (isValidPlate(plate)) { matched = plate; break; }
-    }
+    for (const c of chunks) { if (validatePlate(c).valid) { matched = c; break; } }
+    if (!matched && validatePlate(whole).valid) matched = whole;
+
     if (matched) {
-      pushOcrLog(matched, true);   // mark the accepted read in the log
+      pushOcrLog(text, matched, null);   // mark the accepted read in the log
       lastDetectedDiv.style.display = 'block';
       lastDetectedPlateEl.textContent = matched;
       const isNew = recordPlate(matched);
       showToast(isNew ? `New plate: ${matched}` : `Updated: ${matched}`);
       if (currentTab === 'log') renderLog();
+    } else {
+      // Log the raw read and why the best-looking candidate was rejected.
+      const best = [whole, ...chunks].sort((a, b) => b.length - a.length)[0] || '';
+      const reason = best ? validatePlate(best).reason : 'nothing readable';
+      pushOcrLog(text, null, reason);
     }
   } catch (_) {
     // silently discard OCR errors
