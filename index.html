@@ -1,0 +1,935 @@
+<!--
+  Plate Tracker PWA — License plate scanner and logger.
+  Runs entirely in the browser: no server, no accounts, no external data sent anywhere.
+  All data stored in localStorage. Camera OCR via Tesseract.js.
+
+  Deploy to GitHub Pages:
+  1. Place this index.html in your repo root (or /docs folder).
+  2. Settings → Pages → Source: Deploy from branch → main → / (root).
+  3. Open the published URL in Chrome on Android.
+  4. Allow camera permission when prompted.
+  5. Chrome menu → "Add to Home Screen" for full PWA experience.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#0d0d0d">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Plate Tracker">
+<link rel="manifest" id="manifest-link">
+<title>Plate Tracker</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+
+:root{
+  --bg:#0d0d0d;
+  --bg2:#181818;
+  --bg3:#242424;
+  --text:#e8e8e8;
+  --text2:#888;
+  --accent:#3b82f6;
+  --red:#ef4444;
+  --red-bg:rgba(239,68,68,0.08);
+  --green:#22c55e;
+  --mono:'Courier New',Courier,monospace;
+  --tab-h:64px;
+  --sb:env(safe-area-inset-bottom,0px);
+}
+
+html,body{height:100%;background:var(--bg);color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  font-size:16px;overflow:hidden;-webkit-tap-highlight-color:transparent}
+
+#app{display:flex;flex-direction:column;height:100vh;height:100dvh}
+
+/* TAB BAR */
+#tab-bar{
+  display:flex;background:var(--bg2);
+  border-top:1px solid #2a2a2a;
+  height:calc(var(--tab-h) + var(--sb));
+  padding-bottom:var(--sb);flex-shrink:0;
+}
+.tab-btn{
+  flex:1;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;gap:3px;background:none;border:none;
+  color:var(--text2);font-size:10px;font-weight:700;
+  letter-spacing:.8px;text-transform:uppercase;cursor:pointer;
+  min-height:44px;transition:color .15s;user-select:none;
+}
+.tab-btn.active{color:var(--accent)}
+.tab-icon{font-size:21px;line-height:1}
+
+/* PAGES */
+#pages{flex:1;overflow:hidden;position:relative}
+.page{position:absolute;inset:0;display:none;flex-direction:column;overflow:hidden}
+.page.active{display:flex}
+
+/* ─── SCAN PAGE ─────────────────────────────────── */
+#page-scan{background:#000}
+#video{width:100%;height:100%;object-fit:cover;display:block}
+
+#scan-overlay{
+  position:absolute;inset:0;pointer-events:none;
+  display:flex;flex-direction:column;
+  justify-content:space-between;padding:16px 16px 20px;
+}
+
+#scan-status{
+  align-self:flex-start;background:rgba(0,0,0,.72);
+  color:var(--green);padding:6px 14px;border-radius:24px;
+  font-size:13px;font-weight:700;display:flex;align-items:center;gap:8px;
+}
+#scan-dot{width:8px;height:8px;border-radius:50%;background:var(--green);flex-shrink:0}
+#scan-dot.pulse{animation:dotpulse .45s ease-out}
+@keyframes dotpulse{
+  0%{transform:scale(1);opacity:1}
+  50%{transform:scale(2);opacity:.4}
+  100%{transform:scale(1);opacity:1}
+}
+
+#viewfinder-box{
+  align-self:center;width:80%;max-width:380px;height:22%;
+  border:2px solid rgba(255,255,255,.55);border-radius:8px;
+  position:relative;
+}
+#viewfinder-box::before,#viewfinder-box::after,
+#vf-br,#vf-bl{
+  content:'';position:absolute;width:18px;height:18px;border-color:#fff;border-style:solid;
+}
+#viewfinder-box::before{top:-2px;left:-2px;border-width:3px 0 0 3px;border-radius:6px 0 0 0}
+#viewfinder-box::after{top:-2px;right:-2px;border-width:3px 3px 0 0;border-radius:0 6px 0 0}
+#vf-br{bottom:-2px;right:-2px;border-width:0 3px 3px 0;border-radius:0 0 6px 0}
+#vf-bl{bottom:-2px;left:-2px;border-width:0 0 3px 3px;border-radius:0 0 0 6px}
+
+#last-detected{
+  align-self:center;background:rgba(0,0,0,.8);
+  padding:8px 22px;border-radius:10px;text-align:center;
+  display:none;
+}
+#last-detected-label{font-size:11px;color:rgba(255,255,255,.5);text-transform:uppercase;letter-spacing:1.2px;margin-bottom:4px}
+#last-detected-plate{font-family:var(--mono);font-size:30px;font-weight:900;color:#fff;letter-spacing:5px;word-break:break-all}
+
+#camera-error{
+  display:none;position:absolute;inset:0;background:#000;
+  flex-direction:column;align-items:center;justify-content:center;
+  gap:14px;padding:32px 28px;text-align:center;
+}
+#camera-error.show{display:flex}
+#camera-error h2{color:var(--red);font-size:22px;margin-bottom:4px}
+#camera-error p{color:var(--text2);line-height:1.65;font-size:15px}
+#camera-error-detail{color:#f87171;font-size:13px;margin-top:4px;font-style:italic}
+#retry-btn{
+  margin-top:8px;background:var(--accent);color:#fff;border:none;
+  border-radius:10px;padding:14px 28px;font-size:16px;font-weight:700;cursor:pointer;
+}
+
+/* ─── LOG PAGE ──────────────────────────────────── */
+#page-log{background:var(--bg)}
+
+.page-header{background:var(--bg2);padding:14px 14px 10px;border-bottom:1px solid #2a2a2a;flex-shrink:0}
+.page-title{font-size:20px;font-weight:800;margin-bottom:10px}
+
+#summary{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap}
+.stat{background:var(--bg3);padding:5px 12px;border-radius:8px;font-size:13px;color:var(--text2)}
+.stat span{color:var(--text);font-weight:800}
+
+#search-wrap{position:relative;margin-bottom:10px}
+#search-input{
+  width:100%;background:var(--bg3);border:1px solid #333;border-radius:9px;
+  color:var(--text);padding:10px 14px;font-size:16px;outline:none;
+}
+#search-input:focus{border-color:var(--accent)}
+#search-clear{
+  position:absolute;right:10px;top:50%;transform:translateY(-50%);
+  background:none;border:none;color:var(--text2);font-size:18px;
+  cursor:pointer;padding:4px 8px;display:none;line-height:1;
+}
+
+.sort-btns{display:flex;gap:7px}
+.sort-btn{
+  flex:1;background:var(--bg3);border:1px solid #333;border-radius:8px;
+  color:var(--text2);padding:9px 4px;font-size:12px;font-weight:700;
+  cursor:pointer;min-height:44px;letter-spacing:.3px;transition:all .15s;
+}
+.sort-btn.active{background:var(--accent);border-color:var(--accent);color:#fff}
+
+#plate-list{flex:1;overflow-y:auto;padding:8px 12px 8px}
+
+.plate-entry{
+  background:var(--bg2);border:1px solid #2d2d2d;border-radius:11px;
+  padding:12px 12px 12px 14px;margin-bottom:8px;
+  display:grid;grid-template-columns:1fr auto;
+  grid-template-rows:auto auto;gap:5px 8px;
+}
+.plate-entry.flagged{background:var(--red-bg);border-color:rgba(239,68,68,.45)}
+
+.plate-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.plate-num{font-family:var(--mono);font-size:20px;font-weight:900;letter-spacing:2.5px;word-break:break-all}
+.plate-entry.flagged .plate-num{color:var(--red)}
+
+.plate-badge{
+  background:var(--accent);color:#fff;
+  padding:2px 9px;border-radius:20px;font-size:12px;font-weight:800;white-space:nowrap;
+}
+.plate-entry.flagged .plate-badge{background:var(--red)}
+
+.plate-flag-chip{
+  background:rgba(239,68,68,.18);color:var(--red);
+  border:1px solid rgba(239,68,68,.4);padding:2px 7px;
+  border-radius:20px;font-size:11px;font-weight:700;letter-spacing:.5px;
+}
+
+.plate-times{font-size:11.5px;color:var(--text2);line-height:1.7;grid-column:1}
+
+.plate-actions{
+  display:flex;flex-direction:column;align-items:center;gap:6px;
+  grid-row:1/3;grid-column:2;justify-content:center;
+}
+.icon-btn{
+  background:var(--bg3);border:1px solid #363636;border-radius:9px;
+  color:var(--text2);width:42px;height:42px;
+  display:flex;align-items:center;justify-content:center;
+  cursor:pointer;font-size:18px;transition:all .15s;flex-shrink:0;
+}
+.icon-btn.flag-on{color:var(--red);border-color:rgba(239,68,68,.5)}
+.icon-btn.del:active{color:var(--red);border-color:var(--red)}
+
+/* ─── WATCH LIST PAGE ───────────────────────────── */
+#page-watchlist{background:var(--bg)}
+
+#wl-input-row{
+  display:flex;gap:8px;padding:12px 14px;
+  background:var(--bg2);border-bottom:1px solid #2a2a2a;flex-shrink:0;
+}
+#wl-input{
+  flex:1;background:var(--bg3);border:1px solid #333;border-radius:9px;
+  color:var(--text);padding:10px 14px;font-size:18px;font-family:var(--mono);
+  letter-spacing:2px;text-transform:uppercase;outline:none;
+}
+#wl-input:focus{border-color:var(--accent)}
+#wl-add-btn{
+  background:var(--accent);border:none;border-radius:9px;
+  color:#fff;padding:10px 18px;font-size:16px;font-weight:800;
+  cursor:pointer;min-height:44px;white-space:nowrap;
+}
+
+#wl-list{flex:1;overflow-y:auto;padding:8px 12px}
+
+.wl-entry{
+  background:var(--red-bg);border:1px solid rgba(239,68,68,.4);
+  border-radius:11px;padding:14px 14px;margin-bottom:8px;
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+}
+.wl-plate{font-family:var(--mono);font-size:24px;font-weight:900;color:var(--red);letter-spacing:3px}
+.wl-remove{
+  background:var(--bg3);border:1px solid #444;border-radius:8px;
+  color:var(--text2);padding:9px 16px;font-size:14px;font-weight:700;
+  cursor:pointer;min-height:44px;flex-shrink:0;
+}
+
+#wl-empty{
+  display:none;text-align:center;color:var(--text2);
+  padding:48px 24px;font-size:15px;line-height:1.7;
+}
+
+/* ─── ALERT OVERLAY ─────────────────────────────── */
+#alert-overlay{
+  display:none;position:fixed;inset:0;
+  background:rgba(0,0,0,.93);z-index:900;
+  flex-direction:column;align-items:center;justify-content:center;
+  gap:28px;padding:32px 24px;
+}
+#alert-overlay.show{display:flex}
+
+#alert-box{
+  background:linear-gradient(145deg,#c0392b,#e74c3c);
+  border-radius:18px;padding:36px 28px;text-align:center;
+  width:100%;max-width:420px;
+  box-shadow:0 0 80px rgba(239,68,68,.7),0 0 20px rgba(239,68,68,.4);
+  animation:alertpop .28s cubic-bezier(.34,1.56,.64,1);
+}
+@keyframes alertpop{from{transform:scale(.75);opacity:0}to{transform:scale(1);opacity:1}}
+
+#alert-label{
+  font-size:13px;font-weight:800;text-transform:uppercase;
+  letter-spacing:3px;color:rgba(255,255,255,.75);margin-bottom:18px;
+}
+#alert-plate{
+  font-family:var(--mono);font-size:54px;font-weight:900;
+  letter-spacing:6px;color:#fff;
+  text-shadow:0 3px 12px rgba(0,0,0,.4);
+  word-break:break-all;line-height:1.1;margin-bottom:14px;
+}
+#alert-count{font-size:19px;color:rgba(255,255,255,.88);font-weight:600}
+#alert-dismiss{
+  background:#fff;color:#c0392b;border:none;border-radius:14px;
+  padding:18px 52px;font-size:21px;font-weight:900;cursor:pointer;
+  min-height:58px;letter-spacing:.5px;
+  box-shadow:0 4px 20px rgba(0,0,0,.3);
+}
+
+/* ─── TOAST ─────────────────────────────────────── */
+#toast{
+  position:fixed;
+  bottom:calc(var(--tab-h) + var(--sb) + 14px);
+  left:50%;transform:translateX(-50%) translateY(16px);
+  background:#2d2d2d;color:#fff;
+  padding:10px 22px;border-radius:28px;
+  font-size:14px;font-weight:600;
+  opacity:0;transition:opacity .2s,transform .2s;
+  white-space:nowrap;pointer-events:none;z-index:800;
+  max-width:90vw;overflow:hidden;text-overflow:ellipsis;
+}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* ─── MISC ──────────────────────────────────────── */
+#capture-canvas{display:none}
+
+::-webkit-scrollbar{width:3px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#3a3a3a;border-radius:2px}
+</style>
+</head>
+<body>
+
+<div id="app">
+  <div id="pages">
+
+    <!-- SCAN -->
+    <div id="page-scan" class="page active">
+      <video id="video" autoplay playsinline muted></video>
+      <div id="scan-overlay">
+        <div id="scan-status">
+          <div id="scan-dot"></div>
+          <span id="scan-status-text">Starting…</span>
+        </div>
+        <div id="viewfinder-box">
+          <div id="vf-br"></div><div id="vf-bl"></div>
+        </div>
+        <div id="last-detected">
+          <div id="last-detected-label">Last Detected</div>
+          <div id="last-detected-plate">—</div>
+        </div>
+      </div>
+      <div id="camera-error">
+        <h2>Camera Access Required</h2>
+        <p>Plate Tracker needs the camera to scan plates.<br>
+           It never saves photos — only the extracted text.</p>
+        <p>To fix in Chrome on Android:<br>
+           1. Tap the lock icon in the address bar<br>
+           2. Tap <strong>Permissions → Camera → Allow</strong><br>
+           3. Refresh this page</p>
+        <p id="camera-error-detail"></p>
+        <button id="retry-btn">Retry Camera</button>
+      </div>
+    </div>
+
+    <!-- LOG -->
+    <div id="page-log" class="page">
+      <div class="page-header">
+        <div class="page-title">Plate Log</div>
+        <div id="summary">
+          <div class="stat">Sightings <span id="stat-total">0</span></div>
+          <div class="stat">Unique <span id="stat-unique">0</span></div>
+          <div class="stat">Flagged <span id="stat-flagged">0</span></div>
+        </div>
+        <div id="search-wrap">
+          <input type="search" id="search-input" placeholder="Search plates…"
+            autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false">
+          <button id="search-clear">✕</button>
+        </div>
+        <div class="sort-btns">
+          <button class="sort-btn active" data-sort="recent">Most Recent</button>
+          <button class="sort-btn" data-sort="count">Most Seen</button>
+          <button class="sort-btn" data-sort="az">A – Z</button>
+        </div>
+      </div>
+      <div id="plate-list"></div>
+    </div>
+
+    <!-- WATCH LIST -->
+    <div id="page-watchlist" class="page">
+      <div class="page-header">
+        <div class="page-title">Watch List</div>
+      </div>
+      <div id="wl-input-row">
+        <input type="text" id="wl-input" placeholder="ABC1234" maxlength="8"
+          autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false">
+        <button id="wl-add-btn">+ Add</button>
+      </div>
+      <div id="wl-list"></div>
+      <div id="wl-empty">No plates on your watch list yet.<br>
+        Add a plate above and you'll get a full-screen alert<br>when it's detected by the scanner.</div>
+    </div>
+
+  </div><!-- #pages -->
+
+  <div id="tab-bar">
+    <button class="tab-btn active" data-tab="scan">
+      <span class="tab-icon">📷</span><span>Scan</span>
+    </button>
+    <button class="tab-btn" data-tab="log">
+      <span class="tab-icon">📋</span><span>Log</span>
+    </button>
+    <button class="tab-btn" data-tab="watchlist">
+      <span class="tab-icon">🚨</span><span>Watch List</span>
+    </button>
+  </div>
+</div><!-- #app -->
+
+<!-- ALERT OVERLAY -->
+<div id="alert-overlay">
+  <div id="alert-box">
+    <div id="alert-label">⚠ Watch List Alert ⚠</div>
+    <div id="alert-plate"></div>
+    <div id="alert-count"></div>
+  </div>
+  <button id="alert-dismiss">DISMISS</button>
+</div>
+
+<!-- TOAST -->
+<div id="toast"></div>
+
+<!-- Hidden OCR canvas -->
+<canvas id="capture-canvas"></canvas>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/4.1.1/tesseract.min.js"></script>
+<script>
+'use strict';
+
+// ─────────────────────────────────────────────────────────────
+// PWA: Manifest (generated at runtime so no extra files needed)
+// ─────────────────────────────────────────────────────────────
+(function setupManifest() {
+  function makeIcon(size) {
+    const c = document.createElement('canvas');
+    c.width = size; c.height = size;
+    const x = c.getContext('2d');
+    x.fillStyle = '#0d0d0d';
+    x.fillRect(0, 0, size, size);
+    // Plate shape
+    x.fillStyle = '#1e293b';
+    const rx = size * .08, ry = size * .3, rw = size * .84, rh = size * .4;
+    x.beginPath();
+    x.moveTo(rx + 10, ry);
+    x.lineTo(rx + rw - 10, ry);
+    x.quadraticCurveTo(rx + rw, ry, rx + rw, ry + 10);
+    x.lineTo(rx + rw, ry + rh - 10);
+    x.quadraticCurveTo(rx + rw, ry + rh, rx + rw - 10, ry + rh);
+    x.lineTo(rx + 10, ry + rh);
+    x.quadraticCurveTo(rx, ry + rh, rx, ry + rh - 10);
+    x.lineTo(rx, ry + 10);
+    x.quadraticCurveTo(rx, ry, rx + 10, ry);
+    x.closePath();
+    x.fill();
+    x.fillStyle = '#ef4444';
+    x.font = `900 ${size * .32}px 'Courier New',monospace`;
+    x.textAlign = 'center';
+    x.textBaseline = 'middle';
+    x.fillText('PT', size / 2, size / 2);
+    return c.toDataURL('image/png');
+  }
+  const manifest = {
+    name: 'Plate Tracker',
+    short_name: 'PlateTrack',
+    description: 'License plate scanner and logger — offline-capable PWA',
+    start_url: './',
+    display: 'fullscreen',
+    orientation: 'portrait-primary',
+    background_color: '#0d0d0d',
+    theme_color: '#0d0d0d',
+    icons: [
+      { src: makeIcon(192), sizes: '192x192', type: 'image/png', purpose: 'any maskable' },
+      { src: makeIcon(512), sizes: '512x512', type: 'image/png', purpose: 'any maskable' }
+    ]
+  };
+  const blob = new Blob([JSON.stringify(manifest)], { type: 'application/json' });
+  document.getElementById('manifest-link').href = URL.createObjectURL(blob);
+})();
+
+// ─────────────────────────────────────────────────────────────
+// PWA: Service Worker (blob URL — caches all GETs for offline)
+// ─────────────────────────────────────────────────────────────
+(function registerSW() {
+  if (!('serviceWorker' in navigator)) return;
+  const code = `
+const CACHE = 'pt-v2';
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', e => e.waitUntil(clients.claim()));
+self.addEventListener('fetch', e => {
+  if (e.request.method !== 'GET') return;
+  e.respondWith(
+    fetch(e.request).then(r => {
+      if (r && r.status === 200) {
+        const c = r.clone();
+        caches.open(CACHE).then(cache => cache.put(e.request, c));
+      }
+      return r;
+    }).catch(() => caches.match(e.request))
+  );
+});
+`;
+  const swUrl = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+  navigator.serviceWorker.register(swUrl).catch(() => {});
+})();
+
+// ─────────────────────────────────────────────────────────────
+// Storage
+// ─────────────────────────────────────────────────────────────
+const DB_KEY = 'pt_sightings';
+const WL_KEY = 'pt_watchlist';
+
+function loadPlates() {
+  try { return JSON.parse(localStorage.getItem(DB_KEY) || '[]'); } catch { return []; }
+}
+function savePlates(list) {
+  localStorage.setItem(DB_KEY, JSON.stringify(list));
+}
+function loadWatchList() {
+  try { return JSON.parse(localStorage.getItem(WL_KEY) || '[]'); } catch { return []; }
+}
+function saveWatchList(list) {
+  localStorage.setItem(WL_KEY, JSON.stringify(list));
+}
+
+// ─────────────────────────────────────────────────────────────
+// Plate data operations
+// ─────────────────────────────────────────────────────────────
+function recordPlate(plateText) {
+  const plates = loadPlates();
+  const wl = loadWatchList();
+  const now = new Date().toISOString();
+  const idx = plates.findIndex(p => p.plate === plateText);
+  let count;
+  let isNew = false;
+
+  if (idx >= 0) {
+    plates[idx].count++;
+    plates[idx].lastSeen = now;
+    count = plates[idx].count;
+  } else {
+    plates.push({
+      plate: plateText,
+      count: 1,
+      firstSeen: now,
+      lastSeen: now,
+      flagged: wl.includes(plateText)
+    });
+    count = 1;
+    isNew = true;
+  }
+  savePlates(plates);
+
+  if (wl.includes(plateText)) showAlert(plateText, count);
+  return isNew;
+}
+
+function deletePlate(plateText) {
+  savePlates(loadPlates().filter(p => p.plate !== plateText));
+}
+
+function setFlag(plateText, flagged) {
+  const plates = loadPlates();
+  const wl = loadWatchList();
+  const p = plates.find(e => e.plate === plateText);
+  if (!p) return;
+  p.flagged = flagged;
+  savePlates(plates);
+
+  if (flagged) {
+    if (!wl.includes(plateText)) { wl.push(plateText); saveWatchList(wl); }
+  } else {
+    saveWatchList(wl.filter(w => w !== plateText));
+  }
+}
+
+function addToWatchList(plateText) {
+  const wl = loadWatchList();
+  if (wl.includes(plateText)) return false;
+  wl.push(plateText);
+  saveWatchList(wl);
+  // Flag existing log entries
+  const plates = loadPlates();
+  plates.forEach(p => { if (p.plate === plateText) p.flagged = true; });
+  savePlates(plates);
+  return true;
+}
+
+function removeFromWatchList(plateText) {
+  saveWatchList(loadWatchList().filter(w => w !== plateText));
+  const plates = loadPlates();
+  plates.forEach(p => { if (p.plate === plateText) p.flagged = false; });
+  savePlates(plates);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Toast
+// ─────────────────────────────────────────────────────────────
+let toastTimer = 0;
+const toastEl = document.getElementById('toast');
+function showToast(msg) {
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2600);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Alert overlay
+// ─────────────────────────────────────────────────────────────
+let alertQueue = [];
+let alertActive = false;
+const alertOverlay = document.getElementById('alert-overlay');
+const alertPlateEl = document.getElementById('alert-plate');
+const alertCountEl = document.getElementById('alert-count');
+
+function showAlert(plate, count) {
+  alertQueue.push({ plate, count });
+  if (!alertActive) nextAlert();
+}
+function nextAlert() {
+  if (!alertQueue.length) { alertActive = false; return; }
+  alertActive = true;
+  const { plate, count } = alertQueue.shift();
+  alertPlateEl.textContent = plate;
+  alertCountEl.textContent = `Spotted ${count} time${count !== 1 ? 's' : ''}`;
+  alertOverlay.classList.add('show');
+}
+document.getElementById('alert-dismiss').addEventListener('click', () => {
+  alertOverlay.classList.remove('show');
+  setTimeout(nextAlert, 250);
+});
+
+// ─────────────────────────────────────────────────────────────
+// Camera
+// ─────────────────────────────────────────────────────────────
+const videoEl = document.getElementById('video');
+const cameraErrorEl = document.getElementById('camera-error');
+const cameraErrorDetail = document.getElementById('camera-error-detail');
+const scanStatusText = document.getElementById('scan-status-text');
+const scanDot = document.getElementById('scan-dot');
+const lastDetectedDiv = document.getElementById('last-detected');
+const lastDetectedPlateEl = document.getElementById('last-detected-plate');
+const captureCanvas = document.getElementById('capture-canvas');
+
+let cameraReady = false;
+
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 }
+      },
+      audio: false
+    });
+    videoEl.srcObject = stream;
+    await videoEl.play();
+    cameraErrorEl.classList.remove('show');
+    cameraReady = true;
+    scanStatusText.textContent = 'Loading OCR…';
+    return true;
+  } catch (err) {
+    cameraErrorEl.classList.add('show');
+    cameraErrorDetail.textContent = err.message || String(err);
+    scanStatusText.textContent = 'Camera unavailable';
+    return false;
+  }
+}
+
+document.getElementById('retry-btn').addEventListener('click', async () => {
+  cameraErrorEl.classList.remove('show');
+  const ok = await startCamera();
+  if (ok && !tessWorker) await initOCR();
+});
+
+// ─────────────────────────────────────────────────────────────
+// OCR
+// ─────────────────────────────────────────────────────────────
+let tessWorker = null;
+let ocrBusy = false;
+let scanInterval = null;
+
+function cleanPlate(raw) {
+  return raw.replace(/[^A-Z0-9]/g, '').toUpperCase();
+}
+function isValidPlate(text) {
+  if (text.length < 4 || text.length > 8) return false;
+  return /[A-Z]/.test(text) && /[0-9]/.test(text);
+}
+
+async function initOCR() {
+  try {
+    tessWorker = await Tesseract.createWorker('eng', 1, { logger: () => {} });
+    await tessWorker.setParameters({
+      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+      tessedit_pageseg_mode: '7'
+    });
+    scanStatusText.textContent = 'Scanning…';
+    startScanLoop();
+  } catch (err) {
+    scanStatusText.textContent = 'OCR error: ' + (err.message || err);
+  }
+}
+
+function pulseDot() {
+  scanDot.classList.remove('pulse');
+  void scanDot.offsetWidth;
+  scanDot.classList.add('pulse');
+}
+
+function startScanLoop() {
+  if (scanInterval) return;
+  scanInterval = setInterval(scanFrame, 2000);
+}
+
+async function scanFrame() {
+  if (ocrBusy || !tessWorker || !cameraReady) return;
+  if (videoEl.readyState < 2 || videoEl.paused || videoEl.videoWidth === 0) return;
+
+  ocrBusy = true;
+  pulseDot();
+
+  try {
+    const vw = videoEl.videoWidth;
+    const vh = videoEl.videoHeight;
+    // Crop to the viewfinder zone: center 80% wide, middle 45% tall
+    const sx = vw * 0.10, sy = vh * 0.28;
+    const sw = vw * 0.80, sh = vh * 0.44;
+    // Downscale for speed
+    const scale = Math.min(1, 600 / sw);
+    captureCanvas.width = sw * scale;
+    captureCanvas.height = sh * scale;
+    const ctx = captureCanvas.getContext('2d');
+    // Grayscale + contrast boost via CSS filter (GPU-accelerated)
+    ctx.filter = 'grayscale(1) contrast(1.6) brightness(1.1)';
+    ctx.drawImage(videoEl, sx, sy, sw, sh, 0, 0, captureCanvas.width, captureCanvas.height);
+    ctx.filter = 'none';
+
+    const { data: { text } } = await tessWorker.recognize(captureCanvas);
+    // Try multi-word: split by whitespace, check each chunk
+    const chunks = text.split(/\s+/);
+    for (const chunk of chunks) {
+      const plate = cleanPlate(chunk);
+      if (isValidPlate(plate)) {
+        lastDetectedDiv.style.display = 'block';
+        lastDetectedPlateEl.textContent = plate;
+        const isNew = recordPlate(plate);
+        showToast(isNew ? `New plate: ${plate}` : `Updated: ${plate}`);
+        if (currentTab === 'log') renderLog();
+        break; // take first valid candidate
+      }
+    }
+  } catch (_) {
+    // silently discard OCR errors
+  } finally {
+    ocrBusy = false;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Tab navigation
+// ─────────────────────────────────────────────────────────────
+let currentTab = 'scan';
+
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const tab = btn.dataset.tab;
+    if (tab === currentTab) return;
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('page-' + tab).classList.add('active');
+    currentTab = tab;
+    if (tab === 'log') renderLog();
+    if (tab === 'watchlist') renderWatchList();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// Log page
+// ─────────────────────────────────────────────────────────────
+let sortMode = 'recent';
+let searchQuery = '';
+const plateListEl = document.getElementById('plate-list');
+
+function fmt(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric', year: '2-digit' })
+    + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function renderLog() {
+  let plates = loadPlates();
+
+  // Summary
+  const total = plates.reduce((s, p) => s + p.count, 0);
+  document.getElementById('stat-total').textContent = total;
+  document.getElementById('stat-unique').textContent = plates.length;
+  document.getElementById('stat-flagged').textContent = plates.filter(p => p.flagged).length;
+
+  // Filter
+  if (searchQuery) {
+    const q = searchQuery.toUpperCase();
+    plates = plates.filter(p => p.plate.includes(q));
+  }
+
+  // Sort
+  if (sortMode === 'recent') {
+    plates.sort((a, b) => (b.lastSeen > a.lastSeen ? 1 : -1));
+  } else if (sortMode === 'count') {
+    plates.sort((a, b) => b.count - a.count);
+  } else {
+    plates.sort((a, b) => a.plate.localeCompare(b.plate));
+  }
+
+  if (plates.length === 0) {
+    const msg = searchQuery
+      ? `No plates match "<strong>${searchQuery.toUpperCase()}</strong>".`
+      : 'No plates logged yet.<br>Switch to Scan and point the camera at a license plate.';
+    plateListEl.innerHTML = `<div style="text-align:center;padding:48px 24px;color:var(--text2);line-height:1.7;font-size:15px">${msg}</div>`;
+    return;
+  }
+
+  plateListEl.innerHTML = plates.map(p => `
+<div class="plate-entry${p.flagged ? ' flagged' : ''}" data-plate="${p.plate}">
+  <div class="plate-top">
+    <span class="plate-num">${p.plate}</span>
+    <span class="plate-badge">${p.count}×</span>
+    ${p.flagged ? '<span class="plate-flag-chip">WATCHED</span>' : ''}
+  </div>
+  <div class="plate-times">
+    First&nbsp;seen: ${fmt(p.firstSeen)}<br>
+    Last&nbsp;seen:&nbsp; ${fmt(p.lastSeen)}
+  </div>
+  <div class="plate-actions">
+    <button class="icon-btn${p.flagged ? ' flag-on' : ''} flag-btn"
+      data-plate="${p.plate}" title="${p.flagged ? 'Remove from watch list' : 'Add to watch list'}">
+      ${p.flagged ? '🚩' : '⚑'}
+    </button>
+    <button class="icon-btn del delete-btn" data-plate="${p.plate}" title="Delete entry">🗑</button>
+  </div>
+</div>`).join('');
+}
+
+plateListEl.addEventListener('click', e => {
+  const flagBtn = e.target.closest('.flag-btn');
+  const delBtn = e.target.closest('.delete-btn');
+  if (flagBtn) {
+    const plate = flagBtn.dataset.plate;
+    const plates = loadPlates();
+    const entry = plates.find(p => p.plate === plate);
+    if (entry) {
+      setFlag(plate, !entry.flagged);
+      renderLog();
+      renderWatchList();
+      showToast(entry.flagged ? `${plate} removed from watch list` : `${plate} added to watch list`);
+    }
+  }
+  if (delBtn) {
+    const plate = delBtn.dataset.plate;
+    deletePlate(plate);
+    renderLog();
+    showToast(`Deleted ${plate}`);
+  }
+});
+
+// Search
+const searchInput = document.getElementById('search-input');
+const searchClear = document.getElementById('search-clear');
+searchInput.addEventListener('input', () => {
+  searchQuery = searchInput.value.trim();
+  searchClear.style.display = searchQuery ? 'block' : 'none';
+  renderLog();
+});
+searchClear.addEventListener('click', () => {
+  searchInput.value = '';
+  searchQuery = '';
+  searchClear.style.display = 'none';
+  renderLog();
+  searchInput.focus();
+});
+
+// Sort
+document.querySelectorAll('.sort-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.sort-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    sortMode = btn.dataset.sort;
+    renderLog();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
+// Watch List page
+// ─────────────────────────────────────────────────────────────
+const wlListEl = document.getElementById('wl-list');
+const wlEmptyEl = document.getElementById('wl-empty');
+const wlInput = document.getElementById('wl-input');
+
+function renderWatchList() {
+  const wl = loadWatchList();
+  if (wl.length === 0) {
+    wlListEl.innerHTML = '';
+    wlEmptyEl.style.display = 'block';
+    return;
+  }
+  wlEmptyEl.style.display = 'none';
+  wlListEl.innerHTML = wl.map(plate => `
+<div class="wl-entry">
+  <span class="wl-plate">${plate}</span>
+  <button class="wl-remove" data-plate="${plate}">Remove</button>
+</div>`).join('');
+}
+
+wlListEl.addEventListener('click', e => {
+  const btn = e.target.closest('.wl-remove');
+  if (!btn) return;
+  const plate = btn.dataset.plate;
+  removeFromWatchList(plate);
+  renderWatchList();
+  showToast(`${plate} removed from watch list`);
+  if (currentTab === 'log') renderLog();
+});
+
+// Auto-uppercase input
+wlInput.addEventListener('input', () => {
+  const pos = wlInput.selectionStart;
+  const cleaned = wlInput.value.toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (cleaned !== wlInput.value) {
+    wlInput.value = cleaned;
+    try { wlInput.setSelectionRange(pos, pos); } catch (_) {}
+  }
+});
+wlInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('wl-add-btn').click();
+});
+
+document.getElementById('wl-add-btn').addEventListener('click', () => {
+  const plate = wlInput.value.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (!plate) { showToast('Enter a plate number'); return; }
+  if (plate.length < 2) { showToast('Plate too short'); return; }
+  const added = addToWatchList(plate);
+  showToast(added ? `${plate} added to watch list` : `${plate} is already on the watch list`);
+  wlInput.value = '';
+  renderWatchList();
+  if (currentTab === 'log') renderLog();
+});
+
+// ─────────────────────────────────────────────────────────────
+// Boot
+// ─────────────────────────────────────────────────────────────
+async function boot() {
+  const ok = await startCamera();
+  if (ok) await initOCR();
+}
+boot();
+</script>
+</body>
+</html>
