@@ -144,7 +144,25 @@ html,body{height:100%;background:var(--bg);color:var(--text);
 }
 .ocr-line{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ocr-line.ok{color:var(--green)}
+.ocr-line.err{color:#f87171}
 .ocr-reason{color:rgba(255,176,72,.85)}
+
+/* OCR init-failure box (shown on the scan screen, never silent) */
+#ocr-error{
+  display:none;flex-direction:column;align-items:center;gap:8px;
+  pointer-events:auto;width:100%;max-width:440px;text-align:center;
+  background:rgba(40,0,0,.82);border:1px solid rgba(239,68,68,.6);
+  border-radius:10px;padding:12px 16px;
+}
+#ocr-error-msg{color:var(--red);font-weight:800;font-size:14px}
+#ocr-error-detail{
+  color:#f87171;font-size:11px;font-family:var(--mono);
+  word-break:break-word;line-height:1.5;
+}
+#ocr-retry-btn{
+  margin-top:2px;background:var(--accent);color:#fff;border:none;border-radius:9px;
+  padding:10px 22px;font-size:15px;font-weight:800;cursor:pointer;min-height:44px;
+}
 
 #last-detected{
   background:rgba(0,0,0,.8);
@@ -358,7 +376,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);
   <!-- PERMANENT HEADER (version label lives here) -->
   <div id="app-header">
     <span id="app-title">Plate Tracker</span>
-    <span id="app-version">v0.02</span>
+    <span id="app-version">v0.03</span>
   </div>
 
   <div id="pages">
@@ -377,7 +395,12 @@ html,body{height:100%;background:var(--bg);color:var(--text);
             <div id="last-detected-label">Last Detected</div>
             <div id="last-detected-plate">—</div>
           </div>
-          <button id="capture-btn">📸 Scan Now</button>
+          <div id="ocr-error">
+            <div id="ocr-error-msg">⚠ OCR engine failed to start</div>
+            <div id="ocr-error-detail"></div>
+            <button id="ocr-retry-btn">Retry OCR</button>
+          </div>
+          <button id="capture-btn" disabled>⏳ Initializing OCR…</button>
           <div id="ocr-log">
             <div id="ocr-log-title">Recent OCR reads</div>
             <div id="ocr-log-lines"></div>
@@ -686,6 +709,9 @@ const lastDetectedDiv = document.getElementById('last-detected');
 const lastDetectedPlateEl = document.getElementById('last-detected-plate');
 const captureCanvas = document.getElementById('capture-canvas');
 const ocrLogLinesEl = document.getElementById('ocr-log-lines');
+const captureBtn = document.getElementById('capture-btn');
+const ocrErrorBox = document.getElementById('ocr-error');
+const ocrErrorDetail = document.getElementById('ocr-error-detail');
 
 let cameraReady = false;
 
@@ -696,21 +722,17 @@ const ocrLog = [];
 function escapeHtml(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
-function pushOcrLog(rawText, acceptedPlate, reason) {
-  let entry;
-  if (acceptedPlate) {
-    entry = { text: escapeHtml(acceptedPlate), accepted: true, note: '' };
-  } else {
-    const clean = escapeHtml((rawText || '').replace(/\s+/g, ' ').trim() || '(nothing)');
-    entry = { text: clean, accepted: false, note: reason || 'rejected' };
-  }
-  ocrLog.unshift(entry);
+// kind: 'ok' (accepted) | 'reject' (read but failed validation / empty) |
+// 'error' (recognize/worker threw — full message shown). text/note are already
+// HTML-escaped by callers when they may contain Tesseract output.
+function pushOcrLog(kind, text, note) {
+  ocrLog.unshift({ kind, text: text || '(nothing)', note: note || '' });
   if (ocrLog.length > 5) ocrLog.length = 5;
-  ocrLogLinesEl.innerHTML = ocrLog.map(e =>
-    e.accepted
-      ? `<div class="ocr-line ok">✓ ${e.text}</div>`
-      : `<div class="ocr-line">· ${e.text}<span class="ocr-reason"> — ${e.note}</span></div>`
-  ).join('');
+  ocrLogLinesEl.innerHTML = ocrLog.map(e => {
+    if (e.kind === 'ok') return `<div class="ocr-line ok">✓ ${e.text}</div>`;
+    if (e.kind === 'error') return `<div class="ocr-line err">✕ ${e.text}<span class="ocr-reason"> — ${e.note}</span></div>`;
+    return `<div class="ocr-line">· ${e.text}<span class="ocr-reason"> — ${e.note}</span></div>`;
+  }).join('');
 }
 
 async function startCamera() {
@@ -727,7 +749,7 @@ async function startCamera() {
     await videoEl.play();
     cameraErrorEl.classList.remove('show');
     cameraReady = true;
-    scanStatusText.textContent = 'Loading OCR…';
+    scanStatusText.textContent = 'Initializing OCR engine…';
     return true;
   } catch (err) {
     cameraErrorEl.classList.add('show');
@@ -740,7 +762,7 @@ async function startCamera() {
 document.getElementById('retry-btn').addEventListener('click', async () => {
   cameraErrorEl.classList.remove('show');
   const ok = await startCamera();
-  if (ok && !tessWorker) await initOCR();
+  if (ok && !tessWorker && !ocrInitializing) await initOCR();
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -748,7 +770,19 @@ document.getElementById('retry-btn').addEventListener('click', async () => {
 // ─────────────────────────────────────────────────────────────
 let tessWorker = null;
 let ocrBusy = false;
+let ocrInitializing = false;
 let scanInterval = null;
+
+// Toggle the Scan Now button between ready and a disabled loading state.
+function setCaptureReady(ready, label) {
+  captureBtn.disabled = !ready;
+  captureBtn.textContent = ready ? '📸 Scan Now' : ('⏳ ' + (label || 'Loading…'));
+}
+// Show/hide the on-screen OCR failure box (never fail silently).
+function showOcrError(show, msg) {
+  ocrErrorBox.style.display = show ? 'flex' : 'none';
+  if (show && msg != null) ocrErrorDetail.textContent = msg;
+}
 
 function cleanPlate(raw) {
   return raw.replace(/[^A-Z0-9]/g, '').toUpperCase();
@@ -763,17 +797,53 @@ function validatePlate(text) {
   return { valid: true, reason: '' };
 }
 
+// Create ONE persistent worker, fully initialize it, and only then enable
+// scanning. Nothing scans until this completes. Any failure is shown on screen
+// with a Retry button — never a silent or one-shot Tesseract.recognize().
 async function initOCR() {
+  if (ocrInitializing || tessWorker) return;
+  ocrInitializing = true;
+  showOcrError(false);
+  setCaptureReady(false, 'Initializing OCR…');
+  scanStatusText.textContent = 'Initializing OCR engine…';
+  scanDot.style.background = 'var(--text2)';
+
   try {
-    tessWorker = await Tesseract.createWorker('eng', 1, { logger: () => {} });
-    await tessWorker.setParameters({
+    const worker = await Tesseract.createWorker('eng', 1, {
+      logger: () => {},
+      errorHandler: (err) => {
+        pushOcrLog('error', 'worker', escapeHtml(String((err && err.message) || err)));
+      }
+    });
+    // THE ROOT-CAUSE FIX: in this Tesseract.js build, createWorker() returns a
+    // worker whose native core is NOT yet initialized. Calling setParameters()
+    // or recognize() on it invokes SetVariable on a null core — exactly the
+    // "null is not an object (evaluating 'I.SetVariable')" crash. We must
+    // explicitly load + loadLanguage + initialize FIRST, and await each step,
+    // before any setParameters/recognize call.
+    await worker.load();
+    await worker.loadLanguage('eng');
+    await worker.initialize('eng');
+    await worker.setParameters({
       tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
       tessedit_pageseg_mode: '7'
     });
+
+    tessWorker = worker;                 // assign only once fully ready
+    ocrInitializing = false;
     scanStatusText.textContent = 'Scanning…';
-    startScanLoop();
+    scanDot.style.background = 'var(--green)';
+    setCaptureReady(true);               // enable Scan Now
+    startScanLoop();                      // start auto-scan ONLY now
   } catch (err) {
-    scanStatusText.textContent = 'OCR error: ' + (err.message || err);
+    ocrInitializing = false;
+    tessWorker = null;
+    const msg = (err && (err.message || err.toString())) || 'unknown error';
+    scanStatusText.textContent = 'OCR failed to start';
+    scanDot.style.background = 'var(--red)';
+    setCaptureReady(false, 'OCR unavailable');
+    showOcrError(true, msg);
+    pushOcrLog('error', 'init failed', escapeHtml(msg));
   }
 }
 
@@ -846,7 +916,23 @@ async function scanFrame() {
     // Contrast + grayscale + sharpen on the pixels themselves
     preprocessCanvas(ctx, cw, ch);
 
-    const { data: { text } } = await tessWorker.recognize(captureCanvas);
+    // Every recognize() is wrapped: if it throws, show the FULL error in the
+    // debug log instead of silently dropping the frame.
+    let text = '';
+    try {
+      const result = await tessWorker.recognize(captureCanvas);
+      text = (result && result.data && result.data.text) || '';
+    } catch (err) {
+      const msg = (err && (err.message || err.toString())) || 'unknown error';
+      pushOcrLog('error', 'scan failed', escapeHtml(msg));
+      return;                            // finally still clears ocrBusy
+    }
+
+    // Always log SOMETHING for every attempt, even an empty read.
+    if (!text.trim()) {
+      pushOcrLog('reject', 'empty result', 'no text returned');
+      return;
+    }
 
     // Build candidates: each whitespace-separated chunk plus the whole string,
     // cleaned to A–Z0–9. Accept the first one that passes validation.
@@ -857,7 +943,7 @@ async function scanFrame() {
     if (!matched && validatePlate(whole).valid) matched = whole;
 
     if (matched) {
-      pushOcrLog(text, matched, null);   // mark the accepted read in the log
+      pushOcrLog('ok', escapeHtml(matched), '');   // mark the accepted read
       lastDetectedDiv.style.display = 'block';
       lastDetectedPlateEl.textContent = matched;
       const isNew = recordPlate(matched);
@@ -867,20 +953,28 @@ async function scanFrame() {
       // Log the raw read and why the best-looking candidate was rejected.
       const best = [whole, ...chunks].sort((a, b) => b.length - a.length)[0] || '';
       const reason = best ? validatePlate(best).reason : 'nothing readable';
-      pushOcrLog(text, null, reason);
+      const clean = escapeHtml(text.replace(/\s+/g, ' ').trim() || '(nothing)');
+      pushOcrLog('reject', clean, reason);
     }
-  } catch (_) {
-    // silently discard OCR errors
+  } catch (err) {
+    const msg = (err && (err.message || err.toString())) || 'unknown error';
+    pushOcrLog('error', 'scan failed', escapeHtml(msg));
   } finally {
     ocrBusy = false;
   }
 }
 
 // Manual capture — force an OCR pass at any moment
-document.getElementById('capture-btn').addEventListener('click', () => {
-  if (!cameraReady || !tessWorker) { showToast('Camera/OCR not ready yet'); return; }
+captureBtn.addEventListener('click', () => {
+  if (!cameraReady) { showToast('Camera not ready yet'); return; }
+  if (!tessWorker) { showToast('OCR not ready yet'); return; }
   if (ocrBusy) { showToast('Already scanning…'); return; }
   scanFrame();
+});
+
+// Retry OCR initialization after a failure (shown on the scan screen).
+document.getElementById('ocr-retry-btn').addEventListener('click', () => {
+  if (!ocrInitializing && !tessWorker) initOCR();
 });
 
 // ─────────────────────────────────────────────────────────────
