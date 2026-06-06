@@ -98,20 +98,20 @@ html,body{height:100%;background:var(--bg);color:var(--text);
   100%{transform:scale(1);opacity:1}
 }
 
-/* Green crop box — shows exactly the region sent to OCR
-   (center 60% horizontally, center 50% vertically). */
-#crop-box{
-  position:absolute;top:25%;left:20%;width:60%;height:50%;
-  border:2px solid var(--green);
-  background:rgba(34,197,94,.07);
-  border-radius:8px;
-  box-shadow:0 0 0 100vmax rgba(0,0,0,.22);
+/* Preprocessed-image preview — shows EXACTLY what Tesseract is working with
+   (the full frame after grayscale → blur → adaptive threshold → stretch). */
+#preview-box{
+  position:absolute;top:16px;right:12px;
+  background:rgba(0,0,0,.7);border:1px solid rgba(255,255,255,.25);
+  border-radius:8px;padding:5px;width:150px;pointer-events:none;
 }
-#crop-box::before{
-  content:'Aim plate here';
-  position:absolute;top:-26px;left:0;right:0;text-align:center;
-  font-size:11px;font-weight:700;letter-spacing:.6px;
-  color:rgba(255,255,255,.85);text-shadow:0 1px 3px rgba(0,0,0,.8);
+#preview-label{
+  font-size:8px;letter-spacing:1px;text-transform:uppercase;
+  color:rgba(255,255,255,.6);margin-bottom:3px;text-align:center;
+}
+#preview-canvas{
+  width:100%;display:block;border-radius:4px;background:#000;
+  image-rendering:pixelated;image-rendering:crisp-edges;
 }
 
 /* Bottom controls: last detected, manual capture, OCR attempt log */
@@ -146,6 +146,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);
 .ocr-line.ok{color:var(--green)}
 .ocr-line.err{color:#f87171}
 .ocr-reason{color:rgba(255,176,72,.85)}
+.ocr-conf{font-weight:800}
 
 /* OCR init-failure box (shown on the scan screen, never silent) */
 #ocr-error{
@@ -376,7 +377,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);
   <!-- PERMANENT HEADER (version label lives here) -->
   <div id="app-header">
     <span id="app-title">Plate Tracker</span>
-    <span id="app-version">v0.03</span>
+    <span id="app-version">v0.06</span>
   </div>
 
   <div id="pages">
@@ -389,7 +390,10 @@ html,body{height:100%;background:var(--bg);color:var(--text);
           <div id="scan-dot"></div>
           <span id="scan-status-text">Starting…</span>
         </div>
-        <div id="crop-box"></div>
+        <div id="preview-box">
+          <div id="preview-label">Tesseract sees</div>
+          <canvas id="preview-canvas"></canvas>
+        </div>
         <div id="scan-controls">
           <div id="last-detected">
             <div id="last-detected-label">Last Detected</div>
@@ -712,6 +716,8 @@ const ocrLogLinesEl = document.getElementById('ocr-log-lines');
 const captureBtn = document.getElementById('capture-btn');
 const ocrErrorBox = document.getElementById('ocr-error');
 const ocrErrorDetail = document.getElementById('ocr-error-detail');
+const previewCanvas = document.getElementById('preview-canvas');
+const previewCtx = previewCanvas.getContext('2d');
 
 let cameraReady = false;
 
@@ -724,14 +730,20 @@ function escapeHtml(s) {
 }
 // kind: 'ok' (accepted) | 'reject' (read but failed validation / empty) |
 // 'error' (recognize/worker threw — full message shown). text/note are already
-// HTML-escaped by callers when they may contain Tesseract output.
-function pushOcrLog(kind, text, note) {
-  ocrLog.unshift({ kind, text: text || '(nothing)', note: note || '' });
+// HTML-escaped by callers when they may contain Tesseract output. conf is the
+// Tesseract confidence (0–100): shown green ≥60%, red below 60%.
+function pushOcrLog(kind, text, note, conf) {
+  ocrLog.unshift({
+    kind, text: text || '(nothing)', note: note || '',
+    conf: (typeof conf === 'number' ? conf : null)
+  });
   if (ocrLog.length > 5) ocrLog.length = 5;
   ocrLogLinesEl.innerHTML = ocrLog.map(e => {
-    if (e.kind === 'ok') return `<div class="ocr-line ok">✓ ${e.text}</div>`;
+    const confHtml = e.conf == null ? ''
+      : ` <span class="ocr-conf" style="color:${e.conf >= 60 ? 'var(--green)' : 'var(--red)'}">${Math.round(e.conf)}%</span>`;
+    if (e.kind === 'ok') return `<div class="ocr-line ok">✓ ${e.text}${confHtml}</div>`;
     if (e.kind === 'error') return `<div class="ocr-line err">✕ ${e.text}<span class="ocr-reason"> — ${e.note}</span></div>`;
-    return `<div class="ocr-line">· ${e.text}<span class="ocr-reason"> — ${e.note}</span></div>`;
+    return `<div class="ocr-line">· ${e.text}${confHtml}<span class="ocr-reason"> — ${e.note}</span></div>`;
   }).join('');
 }
 
@@ -772,6 +784,11 @@ let tessWorker = null;
 let ocrBusy = false;
 let ocrInitializing = false;
 let scanInterval = null;
+let scanPausedUntil = 0;            // auto-scan is paused until this timestamp (ms)
+const recentReads = {};            // plate -> last time it was COUNTED (ms) for 10s dedup
+// Offscreen canvas used to upscale the processed frame to ≥600px wide for OCR.
+const ocrCanvas = document.createElement('canvas');
+const ocrCtx = ocrCanvas.getContext('2d', { willReadFrequently: true });
 
 // Toggle the Scan Now button between ready and a disabled loading state.
 function setCaptureReady(ready, label) {
@@ -787,13 +804,35 @@ function showOcrError(show, msg) {
 function cleanPlate(raw) {
   return raw.replace(/[^A-Z0-9]/g, '').toUpperCase();
 }
+
+// Common-misread corrections applied to the RAW OCR text (before cleaning, so
+// letter case is still available). A lowercase "l" or a standalone "I" sitting
+// between two digits is almost always a misread "1". We deliberately leave
+// 0/O and S/5 untouched since real plates use both forms.
+function correctChars(s) {
+  return s.replace(/(?<=[0-9])[lI](?=[0-9])/g, '1');
+}
+
+// True if a single character makes up more than 30% of the string — filters
+// OCR garbage like "IIIIIII".
+function tooRepetitive(s) {
+  const counts = {};
+  let max = 0;
+  for (const ch of s) {
+    counts[ch] = (counts[ch] || 0) + 1;
+    if (counts[ch] > max) max = counts[ch];
+  }
+  return s.length > 0 && (max / s.length) > 0.30;
+}
+
 // Relaxed validation: 3–9 chars, must contain at least one letter (no number
-// required, letter-only plates allowed). Returns the rejection reason so the
-// debug log can show why a read was thrown out.
+// required, letter-only plates allowed), and must not be repetitive garbage.
+// Returns the rejection reason so the debug log can show why a read was thrown out.
 function validatePlate(text) {
   if (text.length < 3) return { valid: false, reason: 'too short' };
   if (text.length > 9) return { valid: false, reason: 'too long' };
   if (!/[A-Z]/.test(text)) return { valid: false, reason: 'no letters' };
+  if (tooRepetitive(text)) return { valid: false, reason: 'repetitive garbage' };
   return { valid: true, reason: '' };
 }
 
@@ -826,7 +865,12 @@ async function initOCR() {
     await worker.initialize('eng');
     await worker.setParameters({
       tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
-      tessedit_pageseg_mode: '7'
+      tessedit_pageseg_mode: '8',        // single word — suits a license plate
+      tessjs_create_hocr: '0',
+      tessjs_create_tsv: '0',
+      tessjs_create_box: '0',
+      tessjs_create_unlv: '0',
+      tessjs_create_osd: '0'
     });
 
     tessWorker = worker;                 // assign only once fully ready
@@ -855,40 +899,102 @@ function pulseDot() {
 
 function startScanLoop() {
   if (scanInterval) return;
-  scanInterval = setInterval(scanFrame, 3000);
+  scanInterval = setInterval(() => {
+    if (Date.now() < scanPausedUntil) return;   // brief pause after a successful read
+    scanFrame();
+  }, 3000);
 }
 
-// Grayscale + contrast + unsharp-mask style sharpen, done on raw pixels so
-// the result actually reaches Tesseract (CSS filters don't affect getImageData).
+// Preprocessing pipeline, applied in this exact order on the raw pixels so the
+// result actually reaches Tesseract (CSS filters don't affect getImageData):
+//   1. Grayscale via luminance  0.299R + 0.587G + 0.114B
+//   2. 3×3 Gaussian blur to reduce noise
+//   3. Adaptive threshold (local-neighbourhood mean) → pure black & white,
+//      so uneven lighting is handled (no global/simple threshold)
+//   4. Contrast stretch: map the min/max pixel values to 0 and 255
 function preprocessCanvas(ctx, w, h) {
   const img = ctx.getImageData(0, 0, w, h);
   const d = img.data;
-  const contrast = 1.9;
-  const intercept = 128 * (1 - contrast);
-  // Grayscale + contrast in place
-  for (let i = 0; i < d.length; i += 4) {
-    let g = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-    g = g * contrast + intercept;
-    g = g < 0 ? 0 : g > 255 ? 255 : g;
-    d[i] = d[i + 1] = d[i + 2] = g;
+  const n = w * h;
+
+  // 1. Grayscale (luminance)
+  const gray = new Float32Array(n);
+  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+    gray[p] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
   }
-  // Sharpen with a 3×3 convolution kernel against a copy of the grayscale data
-  const src = new Uint8ClampedArray(d);
-  const kernel = [0, -1, 0, -1, 5, -1, 0, -1, 0];
-  for (let y = 1; y < h - 1; y++) {
-    for (let x = 1; x < w - 1; x++) {
+
+  // 2. 3×3 Gaussian blur (kernel [1 2 1; 2 4 2; 1 2 1] / 16), edges clamped
+  const blur = new Float32Array(n);
+  const gk = [1, 2, 1, 2, 4, 2, 1, 2, 1];
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
       let sum = 0, ki = 0;
       for (let ky = -1; ky <= 1; ky++) {
+        const yy = y + ky < 0 ? 0 : y + ky >= h ? h - 1 : y + ky;
         for (let kx = -1; kx <= 1; kx++) {
-          sum += src[((y + ky) * w + (x + kx)) * 4] * kernel[ki++];
+          const xx = x + kx < 0 ? 0 : x + kx >= w ? w - 1 : x + kx;
+          sum += gray[yy * w + xx] * gk[ki++];
         }
       }
-      sum = sum < 0 ? 0 : sum > 255 ? 255 : sum;
-      const o = (y * w + x) * 4;
-      d[o] = d[o + 1] = d[o + 2] = sum;
+      blur[y * w + x] = sum / 16;
     }
   }
+
+  // 3. Adaptive threshold using a local mean computed from a summed-area table
+  //    (O(n) regardless of window size). A pixel becomes white when it is
+  //    brighter than its local mean minus a small bias C.
+  const W1 = w + 1;
+  const sat = new Float64Array(W1 * (h + 1));
+  for (let y = 1; y <= h; y++) {
+    let rowSum = 0;
+    for (let x = 1; x <= w; x++) {
+      rowSum += blur[(y - 1) * w + (x - 1)];
+      sat[y * W1 + x] = sat[(y - 1) * W1 + x] + rowSum;
+    }
+  }
+  const R = Math.max(7, Math.round(Math.min(w, h) * 0.04));  // local window radius
+  const C = 8;                                               // bias below local mean
+  const bw = new Float32Array(n);
+  for (let y = 0; y < h; y++) {
+    const y0 = y - R < 0 ? 0 : y - R;
+    const y1 = y + R >= h ? h - 1 : y + R;
+    for (let x = 0; x < w; x++) {
+      const x0 = x - R < 0 ? 0 : x - R;
+      const x1 = x + R >= w ? w - 1 : x + R;
+      const area = (x1 - x0 + 1) * (y1 - y0 + 1);
+      const sum = sat[(y1 + 1) * W1 + (x1 + 1)]
+                - sat[y0 * W1 + (x1 + 1)]
+                - sat[(y1 + 1) * W1 + x0]
+                + sat[y0 * W1 + x0];
+      bw[y * w + x] = blur[y * w + x] > (sum / area - C) ? 255 : 0;
+    }
+  }
+
+  // 4. Contrast stretch — find min/max and stretch them to 0 and 255
+  let mn = 255, mx = 0;
+  for (let p = 0; p < n; p++) {
+    const v = bw[p];
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+  }
+  const range = (mx - mn) || 1;
+  for (let p = 0; p < n; p++) {
+    const v = ((bw[p] - mn) / range) * 255;
+    const o = p * 4;
+    d[o] = d[o + 1] = d[o + 2] = v;
+    d[o + 3] = 255;
+  }
+
   ctx.putImageData(img, 0, 0);
+}
+
+// Mirror the canvas Tesseract receives into the on-screen preview window.
+function updatePreview(srcCanvas) {
+  const pw = 150;
+  const ph = Math.max(1, Math.round(srcCanvas.height * (pw / srcCanvas.width)));
+  previewCanvas.width = pw;
+  previewCanvas.height = ph;
+  previewCtx.drawImage(srcCanvas, 0, 0, pw, ph);
 }
 
 async function scanFrame() {
@@ -901,27 +1007,43 @@ async function scanFrame() {
   try {
     const vw = videoEl.videoWidth;
     const vh = videoEl.videoHeight;
-    // Crop to the center 60% horizontally and center 50% vertically
-    // (matches the green "Aim plate here" crop box overlay).
-    const sx = vw * 0.20, sy = vh * 0.25;
-    const sw = vw * 0.60, sh = vh * 0.50;
-    // Downscale for speed
-    const scale = Math.min(1, 700 / sw);
-    const cw = Math.round(sw * scale);
-    const ch = Math.round(sh * scale);
+    // FULL FRAME — nothing is cropped. The entire camera image is processed so
+    // a plate is detected wherever it appears. We only downscale for processing
+    // speed; the whole frame is preserved (this is a scale, not a crop).
+    const maxW = 960;
+    const workScale = Math.min(1, maxW / vw);
+    const cw = Math.round(vw * workScale);
+    const ch = Math.round(vh * workScale);
     captureCanvas.width = cw;
     captureCanvas.height = ch;
     const ctx = captureCanvas.getContext('2d', { willReadFrequently: true });
-    ctx.drawImage(videoEl, sx, sy, sw, sh, 0, 0, cw, ch);
-    // Contrast + grayscale + sharpen on the pixels themselves
+    ctx.drawImage(videoEl, 0, 0, cw, ch);
+
+    // Grayscale → Gaussian blur → adaptive threshold → contrast stretch.
     preprocessCanvas(ctx, cw, ch);
+
+    // Final pipeline step: scale up to at least 600px wide before OCR.
+    let sendCanvas = captureCanvas;
+    if (cw < 600) {
+      const up = 600 / cw;
+      ocrCanvas.width = Math.round(cw * up);
+      ocrCanvas.height = Math.round(ch * up);
+      ocrCtx.imageSmoothingEnabled = true;
+      ocrCtx.drawImage(captureCanvas, 0, 0, ocrCanvas.width, ocrCanvas.height);
+      sendCanvas = ocrCanvas;
+    }
+
+    // Show exactly what Tesseract is working with.
+    updatePreview(sendCanvas);
 
     // Every recognize() is wrapped: if it throws, show the FULL error in the
     // debug log instead of silently dropping the frame.
-    let text = '';
+    let text = '', conf = 0;
     try {
-      const result = await tessWorker.recognize(captureCanvas);
+      const result = await tessWorker.recognize(sendCanvas);
       text = (result && result.data && result.data.text) || '';
+      conf = (result && result.data && typeof result.data.confidence === 'number')
+        ? result.data.confidence : 0;
     } catch (err) {
       const msg = (err && (err.message || err.toString())) || 'unknown error';
       pushOcrLog('error', 'scan failed', escapeHtml(msg));
@@ -930,31 +1052,52 @@ async function scanFrame() {
 
     // Always log SOMETHING for every attempt, even an empty read.
     if (!text.trim()) {
-      pushOcrLog('reject', 'empty result', 'no text returned');
+      pushOcrLog('reject', 'empty result', 'no text returned', conf);
       return;
     }
 
-    // Build candidates: each whitespace-separated chunk plus the whole string,
-    // cleaned to A–Z0–9. Accept the first one that passes validation.
-    const chunks = text.split(/\s+/).map(cleanPlate).filter(Boolean);
-    const whole = cleanPlate(text);
+    // Reject low-confidence reads outright, before any character validation.
+    if (conf < 40) {
+      const clean = escapeHtml(text.replace(/\s+/g, ' ').trim() || '(nothing)');
+      pushOcrLog('reject', clean, 'confidence < 40%', conf);
+      return;
+    }
+
+    // Apply common-misread character corrections, then build candidates: each
+    // whitespace-separated chunk plus the whole string, cleaned to A–Z0–9.
+    // Accept the first one that passes validation.
+    const corrected = correctChars(text);
+    const chunks = corrected.split(/\s+/).map(cleanPlate).filter(Boolean);
+    const whole = cleanPlate(corrected);
     let matched = null;
     for (const c of chunks) { if (validatePlate(c).valid) { matched = c; break; } }
     if (!matched && validatePlate(whole).valid) matched = whole;
 
     if (matched) {
-      pushOcrLog('ok', escapeHtml(matched), '');   // mark the accepted read
+      const now = Date.now();
+      const last = recentReads[matched] || 0;
+      const countedRecently = (now - last) < 10000;   // same plate within 10s
+
+      // Pause auto-scanning briefly so the same plate isn't grabbed twice.
+      scanPausedUntil = now + 2000;
+
+      pushOcrLog('ok', escapeHtml(matched),
+        countedRecently ? 'seen &lt;10s ago — not re-counted' : '', conf);
       lastDetectedDiv.style.display = 'block';
       lastDetectedPlateEl.textContent = matched;
-      const isNew = recordPlate(matched);
-      showToast(isNew ? `New plate: ${matched}` : `Updated: ${matched}`);
-      if (currentTab === 'log') renderLog();
+
+      if (!countedRecently) {
+        recentReads[matched] = now;                  // remember when we counted it
+        const isNew = recordPlate(matched);
+        showToast(isNew ? `New plate: ${matched}` : `Updated: ${matched}`);
+        if (currentTab === 'log') renderLog();
+      }
     } else {
       // Log the raw read and why the best-looking candidate was rejected.
       const best = [whole, ...chunks].sort((a, b) => b.length - a.length)[0] || '';
       const reason = best ? validatePlate(best).reason : 'nothing readable';
       const clean = escapeHtml(text.replace(/\s+/g, ' ').trim() || '(nothing)');
-      pushOcrLog('reject', clean, reason);
+      pushOcrLog('reject', clean, reason, conf);
     }
   } catch (err) {
     const msg = (err && (err.message || err.toString())) || 'unknown error';
