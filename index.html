@@ -1,10 +1,17 @@
 <!--
   Plate Tracker PWA — License plate scanner and logger.
   Runs entirely in the browser: no server, no accounts, no external data sent anywhere.
-  All data stored in localStorage. Camera OCR via Tesseract.js.
+  All data stored in localStorage.
+
+  Detection is a TWO-STEP ML pipeline:
+    1. A YOLO (v8/v11-style) ONNX model locates the plate in each camera frame.
+    2. The frame is cropped tightly to that box, and Tesseract.js reads ONLY the crop.
+
+  Required file: place a YOLO license-plate ONNX model named "plate-model.onnx"
+  in the SAME folder as this index.html (loaded via the relative path ./plate-model.onnx).
 
   Deploy to GitHub Pages:
-  1. Place this index.html in your repo root (or /docs folder).
+  1. Place this index.html AND plate-model.onnx in your repo root (or /docs folder).
   2. Settings → Pages → Source: Deploy from branch → main → / (root).
   3. Open the published URL in Chrome on Android.
   4. Allow camera permission when prompted.
@@ -81,6 +88,12 @@ html,body{height:100%;background:var(--bg);color:var(--text);
 #page-scan{background:#000}
 #video{width:100%;height:100%;object-fit:cover;display:block}
 
+/* Live YOLO bounding box, drawn over the (object-fit:cover) video feed */
+#bbox-canvas{
+  position:absolute;inset:0;width:100%;height:100%;
+  pointer-events:none;
+}
+
 #scan-overlay{
   position:absolute;inset:0;pointer-events:none;
 }
@@ -98,8 +111,8 @@ html,body{height:100%;background:var(--bg);color:var(--text);
   100%{transform:scale(1);opacity:1}
 }
 
-/* Preprocessed-image preview — shows EXACTLY what Tesseract is working with
-   (the full frame after grayscale → blur → adaptive threshold → stretch). */
+/* Cropped-plate preview — shows EXACTLY what Tesseract is working with
+   (the tight crop around the YOLO box, grayscaled + contrast-stretched). */
 #preview-box{
   position:absolute;top:16px;right:12px;
   background:rgba(0,0,0,.7);border:1px solid rgba(255,255,255,.25);
@@ -114,7 +127,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);
   image-rendering:pixelated;image-rendering:crisp-edges;
 }
 
-/* Bottom controls: last detected, manual capture, OCR attempt log */
+/* Bottom controls: last detected, manual capture, scan attempt log */
 #scan-controls{
   position:absolute;left:0;right:0;bottom:0;
   padding:12px 16px 16px;
@@ -148,7 +161,7 @@ html,body{height:100%;background:var(--bg);color:var(--text);
 .ocr-reason{color:rgba(255,176,72,.85)}
 .ocr-conf{font-weight:800}
 
-/* OCR init-failure box (shown on the scan screen, never silent) */
+/* OCR init-failure box (legacy; init errors now surface on the loading screen) */
 #ocr-error{
   display:none;flex-direction:column;align-items:center;gap:8px;
   pointer-events:auto;width:100%;max-width:440px;text-align:center;
@@ -185,6 +198,42 @@ html,body{height:100%;background:var(--bg);color:var(--text);
 #retry-btn{
   margin-top:8px;background:var(--accent);color:#fff;border:none;
   border-radius:10px;padding:14px 28px;font-size:16px;font-weight:700;cursor:pointer;
+}
+
+/* ─── LOADING SCREEN (model + OCR init) ─────────── */
+#loading-screen{
+  position:fixed;inset:0;z-index:950;background:var(--bg);
+  display:flex;align-items:center;justify-content:center;padding:32px;
+}
+#loading-screen.hidden{display:none}
+#loading-card{
+  width:100%;max-width:340px;display:flex;flex-direction:column;
+  align-items:center;gap:18px;text-align:center;
+}
+#loading-spinner{
+  width:54px;height:54px;border-radius:50%;
+  border:4px solid #2a2a2a;border-top-color:var(--accent);
+  animation:spin .9s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+#loading-title{font-size:18px;font-weight:800;letter-spacing:.3px}
+#loading-bar-track{
+  width:100%;height:8px;background:var(--bg3);
+  border-radius:6px;overflow:hidden;
+}
+#loading-bar{height:100%;width:0%;background:var(--accent);border-radius:6px;transition:width .25s ease}
+#loading-detail{font-size:12px;color:var(--text2);font-family:var(--mono);min-height:16px}
+#loading-error{
+  display:none;flex-direction:column;gap:10px;width:100%;text-align:left;
+  background:rgba(40,0,0,.55);border:1px solid rgba(239,68,68,.5);
+  border-radius:12px;padding:16px;
+}
+#loading-error.show{display:flex}
+#loading-error-msg{color:var(--red);font-weight:800;font-size:15px}
+#loading-error-detail{color:#f87171;font-size:11.5px;font-family:var(--mono);word-break:break-word;line-height:1.5}
+#loading-retry{
+  background:var(--accent);color:#fff;border:none;border-radius:10px;
+  padding:12px 24px;font-size:15px;font-weight:800;cursor:pointer;min-height:46px;
 }
 
 /* ─── LOG PAGE ──────────────────────────────────── */
@@ -372,12 +421,28 @@ html,body{height:100%;background:var(--bg);color:var(--text);
 </head>
 <body>
 
+<!-- LOADING SCREEN — covers the app until BOTH the ONNX model and the
+     Tesseract worker are fully initialized. Scanning is impossible before then. -->
+<div id="loading-screen">
+  <div id="loading-card">
+    <div id="loading-spinner"></div>
+    <div id="loading-title">Loading AI model…</div>
+    <div id="loading-bar-track"><div id="loading-bar"></div></div>
+    <div id="loading-detail">Starting…</div>
+    <div id="loading-error">
+      <div id="loading-error-msg">⚠ Failed to load</div>
+      <div id="loading-error-detail"></div>
+      <button id="loading-retry">Retry</button>
+    </div>
+  </div>
+</div>
+
 <div id="app">
 
   <!-- PERMANENT HEADER (version label lives here) -->
   <div id="app-header">
     <span id="app-title">Plate Tracker</span>
-    <span id="app-version">v0.06</span>
+    <span id="app-version">v0.07</span>
   </div>
 
   <div id="pages">
@@ -385,13 +450,14 @@ html,body{height:100%;background:var(--bg);color:var(--text);
     <!-- SCAN -->
     <div id="page-scan" class="page active">
       <video id="video" autoplay playsinline muted></video>
+      <canvas id="bbox-canvas"></canvas>
       <div id="scan-overlay">
         <div id="scan-status">
           <div id="scan-dot"></div>
           <span id="scan-status-text">Starting…</span>
         </div>
         <div id="preview-box">
-          <div id="preview-label">Tesseract sees</div>
+          <div id="preview-label">Plate crop</div>
           <canvas id="preview-canvas"></canvas>
         </div>
         <div id="scan-controls">
@@ -404,9 +470,9 @@ html,body{height:100%;background:var(--bg);color:var(--text);
             <div id="ocr-error-detail"></div>
             <button id="ocr-retry-btn">Retry OCR</button>
           </div>
-          <button id="capture-btn" disabled>⏳ Initializing OCR…</button>
+          <button id="capture-btn" disabled>⏳ Loading…</button>
           <div id="ocr-log">
-            <div id="ocr-log-title">Recent OCR reads</div>
+            <div id="ocr-log-title">Recent scans</div>
             <div id="ocr-log-lines"></div>
           </div>
         </div>
@@ -491,10 +557,11 @@ html,body{height:100%;background:var(--bg);color:var(--text);
 <!-- TOAST -->
 <div id="toast"></div>
 
-<!-- Hidden OCR canvas -->
+<!-- Hidden full-frame capture canvas (source for the YOLO crop) -->
 <canvas id="capture-canvas"></canvas>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/4.1.1/tesseract.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
 <script>
 'use strict';
 
@@ -702,7 +769,7 @@ document.getElementById('alert-dismiss').addEventListener('click', () => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// Camera
+// Element references
 // ─────────────────────────────────────────────────────────────
 const videoEl = document.getElementById('video');
 const cameraErrorEl = document.getElementById('camera-error');
@@ -711,42 +778,65 @@ const scanStatusText = document.getElementById('scan-status-text');
 const scanDot = document.getElementById('scan-dot');
 const lastDetectedDiv = document.getElementById('last-detected');
 const lastDetectedPlateEl = document.getElementById('last-detected-plate');
-const captureCanvas = document.getElementById('capture-canvas');
 const ocrLogLinesEl = document.getElementById('ocr-log-lines');
 const captureBtn = document.getElementById('capture-btn');
-const ocrErrorBox = document.getElementById('ocr-error');
-const ocrErrorDetail = document.getElementById('ocr-error-detail');
 const previewCanvas = document.getElementById('preview-canvas');
 const previewCtx = previewCanvas.getContext('2d');
+const bboxCanvas = document.getElementById('bbox-canvas');
+const bboxCtx = bboxCanvas.getContext('2d');
+
+// Loading-screen references
+const loadingScreen = document.getElementById('loading-screen');
+const loadingBar = document.getElementById('loading-bar');
+const loadingTitle = document.getElementById('loading-title');
+const loadingDetail = document.getElementById('loading-detail');
+const loadingSpinner = document.getElementById('loading-spinner');
+const loadingError = document.getElementById('loading-error');
+const loadingErrorMsg = document.getElementById('loading-error-msg');
+const loadingErrorDetail = document.getElementById('loading-error-detail');
 
 let cameraReady = false;
 
-// Running log of the last 5 raw OCR reads (incl. rejected) for debugging.
-// Rejected reads also show exactly what Tesseract returned and WHY it was
-// rejected (too short, too long, no letters, nothing readable).
-const ocrLog = [];
 function escapeHtml(s) {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-// kind: 'ok' (accepted) | 'reject' (read but failed validation / empty) |
-// 'error' (recognize/worker threw — full message shown). text/note are already
-// HTML-escaped by callers when they may contain Tesseract output. conf is the
-// Tesseract confidence (0–100): shown green ≥60%, red below 60%.
-function pushOcrLog(kind, text, note, conf) {
-  ocrLog.unshift({
-    kind, text: text || '(nothing)', note: note || '',
-    conf: (typeof conf === 'number' ? conf : null)
-  });
-  if (ocrLog.length > 5) ocrLog.length = 5;
-  ocrLogLinesEl.innerHTML = ocrLog.map(e => {
-    const confHtml = e.conf == null ? ''
-      : ` <span class="ocr-conf" style="color:${e.conf >= 60 ? 'var(--green)' : 'var(--red)'}">${Math.round(e.conf)}%</span>`;
-    if (e.kind === 'ok') return `<div class="ocr-line ok">✓ ${e.text}${confHtml}</div>`;
-    if (e.kind === 'error') return `<div class="ocr-line err">✕ ${e.text}<span class="ocr-reason"> — ${e.note}</span></div>`;
-    return `<div class="ocr-line">· ${e.text}${confHtml}<span class="ocr-reason"> — ${e.note}</span></div>`;
-  }).join('');
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+// ─────────────────────────────────────────────────────────────
+// Debug log — last 5 scan attempts (YOLO result + Tesseract read)
+// Each entry records: whether YOLO found a plate, the YOLO confidence,
+// the raw Tesseract output, whether it passed validation, and (if rejected)
+// the reason. Confidence scores < 60% render red, ≥ 60% green.
+// ─────────────────────────────────────────────────────────────
+const scanLog = [];
+function confSpan(pct) {
+  if (pct == null) return '';
+  const col = pct >= 60 ? 'var(--green)' : 'var(--red)';
+  return ` <span class="ocr-conf" style="color:${col}">${Math.round(pct)}%</span>`;
+}
+function renderScanLine(e) {
+  if (e.error) {
+    return `<div class="ocr-line err">✕ ${e.error}</div>`;
+  }
+  if (!e.yoloFound) {
+    return `<div class="ocr-line">· No plate detected</div>`;
+  }
+  const yolo = `YOLO${confSpan(e.yoloConf)}`;
+  const raw = e.raw ? `&quot;${e.raw}&quot;` : '(no text)';
+  if (e.accepted) {
+    const note = e.reason ? `<span class="ocr-reason"> — ${e.reason}</span>` : '';
+    return `<div class="ocr-line ok">✓ ${yolo} · ${raw}${confSpan(e.tessConf)}${note}</div>`;
+  }
+  return `<div class="ocr-line">· ${yolo} · ${raw}${confSpan(e.tessConf)}<span class="ocr-reason"> — ${e.reason}</span></div>`;
+}
+function pushScanLog(entry) {
+  scanLog.unshift(entry);
+  if (scanLog.length > 5) scanLog.length = 5;
+  ocrLogLinesEl.innerHTML = scanLog.map(renderScanLine).join('');
+}
+
+// ─────────────────────────────────────────────────────────────
+// Camera
+// ─────────────────────────────────────────────────────────────
 async function startCamera() {
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -761,9 +851,15 @@ async function startCamera() {
     await videoEl.play();
     cameraErrorEl.classList.remove('show');
     cameraReady = true;
-    scanStatusText.textContent = 'Initializing OCR engine…';
+    if (enginesReady) {
+      scanStatusText.textContent = 'Scanning…';
+      scanDot.style.background = 'var(--green)';
+    } else {
+      scanStatusText.textContent = 'Loading AI model…';
+    }
     return true;
   } catch (err) {
+    cameraReady = false;
     cameraErrorEl.classList.add('show');
     cameraErrorDetail.textContent = err.message || String(err);
     scanStatusText.textContent = 'Camera unavailable';
@@ -773,44 +869,77 @@ async function startCamera() {
 
 document.getElementById('retry-btn').addEventListener('click', async () => {
   cameraErrorEl.classList.remove('show');
-  const ok = await startCamera();
-  if (ok && !tessWorker && !ocrInitializing) await initOCR();
+  await startCamera();
 });
 
 // ─────────────────────────────────────────────────────────────
-// OCR
+// Engine state (ONNX detector + Tesseract reader)
 // ─────────────────────────────────────────────────────────────
-let tessWorker = null;
-let ocrBusy = false;
-let ocrInitializing = false;
-let scanInterval = null;
-let scanPausedUntil = 0;            // auto-scan is paused until this timestamp (ms)
-const recentReads = {};            // plate -> last time it was COUNTED (ms) for 10s dedup
-// Offscreen canvas used to upscale the processed frame to ≥600px wide for OCR.
-const ocrCanvas = document.createElement('canvas');
-const ocrCtx = ocrCanvas.getContext('2d', { willReadFrequently: true });
+let onnxSession = null;       // YOLO ONNX session
+let tessWorker = null;        // persistent Tesseract worker
+let enginesReady = false;     // true only when BOTH are initialized
+let detecting = false;        // lock: a detection pass is in flight
+let ocrBusy = false;          // lock: an OCR pass is in flight
+let detectInterval = null;
+let lastOcrAt = 0;            // ms of last OCR scan attempt (3s auto-scan cadence)
+let scanPausedUntil = 0;      // auto-scan paused until this timestamp (ms)
+const recentReads = {};       // plate -> last time it was COUNTED (ms) for 10s dedup
+
+const YOLO_SIZE = 640;        // model input is [1,3,640,640]
+const YOLO_CONF = 0.5;        // only use detections above this confidence
+const MODEL_URL = './plate-model.onnx';
+
+// Offscreen canvases: full frame (crop source), YOLO 640 input, and the crop.
+const frameCanvas = document.getElementById('capture-canvas');
+const frameCtx = frameCanvas.getContext('2d', { willReadFrequently: true });
+const yoloCanvas = document.createElement('canvas');
+yoloCanvas.width = YOLO_SIZE; yoloCanvas.height = YOLO_SIZE;
+const yoloCtx = yoloCanvas.getContext('2d', { willReadFrequently: true });
+const cropCanvas = document.createElement('canvas');
+const cropCtx = cropCanvas.getContext('2d', { willReadFrequently: true });
 
 // Toggle the Scan Now button between ready and a disabled loading state.
 function setCaptureReady(ready, label) {
   captureBtn.disabled = !ready;
   captureBtn.textContent = ready ? '📸 Scan Now' : ('⏳ ' + (label || 'Loading…'));
 }
-// Show/hide the on-screen OCR failure box (never fail silently).
-function showOcrError(show, msg) {
-  ocrErrorBox.style.display = show ? 'flex' : 'none';
-  if (show && msg != null) ocrErrorDetail.textContent = msg;
+
+// ─────────────────────────────────────────────────────────────
+// Loading screen helpers
+// ─────────────────────────────────────────────────────────────
+function setLoadingProgress(frac) {
+  loadingBar.style.width = Math.round(Math.max(0, Math.min(1, frac)) * 100) + '%';
+}
+function setLoadingDetail(t) { loadingDetail.textContent = t; }
+function hideLoading() { loadingScreen.classList.add('hidden'); }
+function hideLoadingError() {
+  loadingError.classList.remove('show');
+  loadingSpinner.style.display = '';
+  loadingTitle.textContent = 'Loading AI model…';
+}
+function showLoadingError(err) {
+  const msg = (err && (err.message || err.toString())) || 'unknown error';
+  loadingSpinner.style.display = 'none';
+  loadingTitle.textContent = 'Could not start';
+  loadingError.classList.add('show');
+  // A missing/unreachable model file is the most likely first-run failure.
+  const missing = /plate-model\.onnx|HTTP 404|Failed to fetch|NetworkError/i.test(msg);
+  loadingErrorMsg.textContent = missing ? '⚠ Detection model not found' : '⚠ Failed to load';
+  loadingErrorDetail.textContent = missing
+    ? 'Make sure plate-model.onnx is in the same folder as index.html, then Retry. (' + msg + ')'
+    : msg;
 }
 
+// ─────────────────────────────────────────────────────────────
+// Validation helpers
+// ─────────────────────────────────────────────────────────────
 function cleanPlate(raw) {
   return raw.replace(/[^A-Z0-9]/g, '').toUpperCase();
 }
 
-// Common-misread corrections applied to the RAW OCR text (before cleaning, so
-// letter case is still available). A lowercase "l" or a standalone "I" sitting
-// between two digits is almost always a misread "1". We deliberately leave
-// 0/O and S/5 untouched since real plates use both forms.
+// Common-misread correction: a lowercase "l" is almost always a misread "1".
 function correctChars(s) {
-  return s.replace(/(?<=[0-9])[lI](?=[0-9])/g, '1');
+  return s.replace(/l/g, '1');
 }
 
 // True if a single character makes up more than 30% of the string — filters
@@ -825,170 +954,270 @@ function tooRepetitive(s) {
   return s.length > 0 && (max / s.length) > 0.30;
 }
 
-// Relaxed validation: 3–9 chars, must contain at least one letter (no number
-// required, letter-only plates allowed), and must not be repetitive garbage.
-// Returns the rejection reason so the debug log can show why a read was thrown out.
+// Length 3–9, and not repetitive garbage. Returns the rejection reason so the
+// debug log can show why a read was thrown out.
 function validatePlate(text) {
   if (text.length < 3) return { valid: false, reason: 'too short' };
   if (text.length > 9) return { valid: false, reason: 'too long' };
-  if (!/[A-Z]/.test(text)) return { valid: false, reason: 'no letters' };
   if (tooRepetitive(text)) return { valid: false, reason: 'repetitive garbage' };
   return { valid: true, reason: '' };
 }
 
-// Create ONE persistent worker, fully initialize it, and only then enable
-// scanning. Nothing scans until this completes. Any failure is shown on screen
-// with a Retry button — never a silent or one-shot Tesseract.recognize().
-async function initOCR() {
-  if (ocrInitializing || tessWorker) return;
-  ocrInitializing = true;
-  showOcrError(false);
-  setCaptureReady(false, 'Initializing OCR…');
-  scanStatusText.textContent = 'Initializing OCR engine…';
-  scanDot.style.background = 'var(--text2)';
+// ─────────────────────────────────────────────────────────────
+// Engine initialization (model download + ONNX session + Tesseract worker)
+// ─────────────────────────────────────────────────────────────
 
+// Fetch the model with download progress so the loading bar reflects real work.
+async function fetchWithProgress(url, onProgress) {
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error('HTTP ' + resp.status + ' fetching ' + url);
+  const total = +(resp.headers.get('Content-Length') || 0);
+  if (!resp.body || !total) {
+    const buf = await resp.arrayBuffer();
+    onProgress(1);
+    return new Uint8Array(buf);
+  }
+  const reader = resp.body.getReader();
+  let received = 0;
+  const chunks = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    onProgress(received / total);
+  }
+  const out = new Uint8Array(received);
+  let pos = 0;
+  for (const c of chunks) { out.set(c, pos); pos += c.length; }
+  return out;
+}
+
+async function initModel() {
+  if (typeof ort === 'undefined') throw new Error('ONNX Runtime failed to load from CDN');
+  // WebAssembly backend only (no WebGL). Single-threaded so it works without
+  // cross-origin isolation (e.g. on GitHub Pages). WASM binaries from the CDN.
+  ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/';
+  ort.env.wasm.numThreads = 1;
+  ort.env.logLevel = 'error';
+
+  setLoadingDetail('Downloading detection model…');
+  const bytes = await fetchWithProgress(MODEL_URL, f => {
+    setLoadingProgress(f * 0.8);                       // model download = 0–80%
+    setLoadingDetail('Downloading model — ' + Math.round(f * 100) + '%');
+  });
+
+  setLoadingDetail('Starting detection engine…');
+  setLoadingProgress(0.85);
+  onnxSession = await ort.InferenceSession.create(bytes, { executionProviders: ['wasm'] });
+}
+
+async function initOCRWorker() {
+  const worker = await Tesseract.createWorker('eng', 1, {
+    logger: () => {},
+    errorHandler: (err) => {
+      pushScanLog({ error: 'worker: ' + escapeHtml(String((err && err.message) || err)) });
+    }
+  });
+  // Explicitly load + loadLanguage + initialize before setParameters/recognize.
+  await worker.load();
+  await worker.loadLanguage('eng');
+  await worker.initialize('eng');
+  await worker.setParameters({
+    tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+    tessedit_pageseg_mode: '8',        // single word — suits a cropped plate
+    tessjs_create_hocr: '0',
+    tessjs_create_tsv: '0',
+    tessjs_create_box: '0',
+    tessjs_create_unlv: '0',
+    tessjs_create_osd: '0'
+  });
+  tessWorker = worker;
+}
+
+// Initialize BOTH engines. Nothing scans until this fully completes. Any failure
+// is shown on the loading screen with a Retry button — never silent.
+async function initEngines() {
+  if (enginesReady) return;
+  hideLoadingError();
+  setLoadingProgress(0);
+  setLoadingDetail('Starting…');
   try {
-    const worker = await Tesseract.createWorker('eng', 1, {
-      logger: () => {},
-      errorHandler: (err) => {
-        pushOcrLog('error', 'worker', escapeHtml(String((err && err.message) || err)));
-      }
-    });
-    // THE ROOT-CAUSE FIX: in this Tesseract.js build, createWorker() returns a
-    // worker whose native core is NOT yet initialized. Calling setParameters()
-    // or recognize() on it invokes SetVariable on a null core — exactly the
-    // "null is not an object (evaluating 'I.SetVariable')" crash. We must
-    // explicitly load + loadLanguage + initialize FIRST, and await each step,
-    // before any setParameters/recognize call.
-    await worker.load();
-    await worker.loadLanguage('eng');
-    await worker.initialize('eng');
-    await worker.setParameters({
-      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
-      tessedit_pageseg_mode: '8',        // single word — suits a license plate
-      tessjs_create_hocr: '0',
-      tessjs_create_tsv: '0',
-      tessjs_create_box: '0',
-      tessjs_create_unlv: '0',
-      tessjs_create_osd: '0'
-    });
+    await initModel();
+    setLoadingDetail('Initializing OCR engine…');
+    setLoadingProgress(0.9);
+    await initOCRWorker();
+    setLoadingProgress(1);
+    onEnginesReady();
+  } catch (err) {
+    showLoadingError(err);
+  }
+}
 
-    tessWorker = worker;                 // assign only once fully ready
-    ocrInitializing = false;
+function onEnginesReady() {
+  enginesReady = true;
+  hideLoading();
+  setCaptureReady(true);
+  if (cameraReady) {
     scanStatusText.textContent = 'Scanning…';
     scanDot.style.background = 'var(--green)';
-    setCaptureReady(true);               // enable Scan Now
-    startScanLoop();                      // start auto-scan ONLY now
-  } catch (err) {
-    ocrInitializing = false;
-    tessWorker = null;
-    const msg = (err && (err.message || err.toString())) || 'unknown error';
-    scanStatusText.textContent = 'OCR failed to start';
+  } else {
+    scanStatusText.textContent = 'Camera unavailable';
     scanDot.style.background = 'var(--red)';
-    setCaptureReady(false, 'OCR unavailable');
-    showOcrError(true, msg);
-    pushOcrLog('error', 'init failed', escapeHtml(msg));
   }
+  startDetectLoop();
 }
 
-function pulseDot() {
-  scanDot.classList.remove('pulse');
-  void scanDot.offsetWidth;
-  scanDot.classList.add('pulse');
+document.getElementById('loading-retry').addEventListener('click', () => {
+  if (!enginesReady) initEngines();
+});
+document.getElementById('ocr-retry-btn').addEventListener('click', () => {
+  if (!enginesReady) initEngines();
+});
+
+// ─────────────────────────────────────────────────────────────
+// STEP 1 — YOLO detection
+// ─────────────────────────────────────────────────────────────
+
+// Parse a YOLOv8/v11 detection output tensor. Standard export shape is
+// [1, 4+nc, 8400] (channels-first); we also tolerate [1, 8400, 4+nc].
+// Box coords (cx,cy,w,h) are in 640px input space; returned as normalized
+// [0,1] frame coords. Only the single highest-confidence box (≥ YOLO_CONF)
+// is returned, or null if none qualify.
+function parseYolo(output) {
+  const dims = output.dims;
+  const data = output.data;
+  if (!dims || dims.length !== 3) return null;
+
+  let nattr, np, channelsFirst;
+  if (dims[1] <= dims[2]) { nattr = dims[1]; np = dims[2]; channelsFirst = true; }
+  else { nattr = dims[2]; np = dims[1]; channelsFirst = false; }
+
+  const at = (a, i) => channelsFirst ? data[a * np + i] : data[i * nattr + a];
+
+  let best = null;
+  for (let i = 0; i < np; i++) {
+    let score = 0;                                   // max class score (attrs 4..)
+    for (let a = 4; a < nattr; a++) { const s = at(a, i); if (s > score) score = s; }
+    if (score < YOLO_CONF) continue;
+    if (!best || score > best.score) {
+      best = { score, cx: at(0, i), cy: at(1, i), w: at(2, i), h: at(3, i) };
+    }
+  }
+  if (!best) return null;
+
+  const clamp = v => Math.max(0, Math.min(1, v));
+  return {
+    score: best.score,
+    x0: clamp((best.cx - best.w / 2) / YOLO_SIZE),
+    y0: clamp((best.cy - best.h / 2) / YOLO_SIZE),
+    x1: clamp((best.cx + best.w / 2) / YOLO_SIZE),
+    y1: clamp((best.cy + best.h / 2) / YOLO_SIZE)
+  };
 }
 
-function startScanLoop() {
-  if (scanInterval) return;
-  scanInterval = setInterval(() => {
-    if (Date.now() < scanPausedUntil) return;   // brief pause after a successful read
-    scanFrame();
-  }, 3000);
+// Capture the current frame, run YOLO, draw the box, and return it (or null).
+async function runDetection() {
+  const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
+  if (!vw || !vh) { drawBox(null); return null; }
+
+  // Keep the full native frame as the crop source.
+  frameCanvas.width = vw; frameCanvas.height = vh;
+  frameCtx.drawImage(videoEl, 0, 0, vw, vh);
+
+  // Build the 640×640 model input (simple resize), normalized RGB in CHW order.
+  yoloCtx.drawImage(frameCanvas, 0, 0, YOLO_SIZE, YOLO_SIZE);
+  const px = yoloCtx.getImageData(0, 0, YOLO_SIZE, YOLO_SIZE).data;
+  const area = YOLO_SIZE * YOLO_SIZE;
+  const input = new Float32Array(3 * area);
+  for (let i = 0; i < area; i++) {
+    const o = i * 4;
+    input[i] = px[o] / 255;             // R
+    input[area + i] = px[o + 1] / 255;  // G
+    input[2 * area + i] = px[o + 2] / 255; // B
+  }
+  const tensor = new ort.Tensor('float32', input, [1, 3, YOLO_SIZE, YOLO_SIZE]);
+  const feeds = {};
+  feeds[onnxSession.inputNames[0]] = tensor;
+  const out = await onnxSession.run(feeds);
+  const box = parseYolo(out[onnxSession.outputNames[0]]);
+  drawBox(box);
+  return box;
 }
 
-// Preprocessing pipeline, applied in this exact order on the raw pixels so the
-// result actually reaches Tesseract (CSS filters don't affect getImageData):
-//   1. Grayscale via luminance  0.299R + 0.587G + 0.114B
-//   2. 3×3 Gaussian blur to reduce noise
-//   3. Adaptive threshold (local-neighbourhood mean) → pure black & white,
-//      so uneven lighting is handled (no global/simple threshold)
-//   4. Contrast stretch: map the min/max pixel values to 0 and 255
-function preprocessCanvas(ctx, w, h) {
+// Draw the green YOLO box over the (object-fit:cover) video feed. Box coords are
+// normalized to the frame; we map them through the cover transform.
+function drawBox(box) {
+  const cw = bboxCanvas.clientWidth, ch = bboxCanvas.clientHeight;
+  if (bboxCanvas.width !== cw) bboxCanvas.width = cw;
+  if (bboxCanvas.height !== ch) bboxCanvas.height = ch;
+  bboxCtx.clearRect(0, 0, cw, ch);
+  if (!box) return;
+  const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
+  if (!vw || !vh) return;
+
+  const scale = Math.max(cw / vw, ch / vh);       // object-fit: cover
+  const dispW = vw * scale, dispH = vh * scale;
+  const offX = (cw - dispW) / 2, offY = (ch - dispH) / 2;
+
+  const rx = box.x0 * vw * scale + offX;
+  const ry = box.y0 * vh * scale + offY;
+  const rw = (box.x1 - box.x0) * vw * scale;
+  const rh = (box.y1 - box.y0) * vh * scale;
+
+  bboxCtx.strokeStyle = '#22c55e';
+  bboxCtx.lineWidth = 3;
+  bboxCtx.strokeRect(rx, ry, rw, rh);
+}
+
+// ─────────────────────────────────────────────────────────────
+// STEP 2 — crop + Tesseract
+// ─────────────────────────────────────────────────────────────
+
+// Crop the full frame to the YOLO box (with a small margin), upscale to at
+// least 300px wide, then grayscale + contrast-stretch for OCR.
+function buildCrop(box) {
+  const fw = frameCanvas.width, fh = frameCanvas.height;
+  const pad = 0.06;                                 // small margin around the box
+  const x0 = Math.max(0, box.x0 - pad), y0 = Math.max(0, box.y0 - pad);
+  const x1 = Math.min(1, box.x1 + pad), y1 = Math.min(1, box.y1 + pad);
+
+  const sx = x0 * fw, sy = y0 * fh;
+  const sw = Math.max(1, (x1 - x0) * fw), sh = Math.max(1, (y1 - y0) * fh);
+
+  const targetW = Math.max(400, Math.round(sw));    // ≥300px required; upscale small crops
+  const scale = targetW / sw;
+  const tw = Math.round(sw * scale), th = Math.max(1, Math.round(sh * scale));
+
+  cropCanvas.width = tw; cropCanvas.height = th;
+  cropCtx.imageSmoothingEnabled = true;
+  cropCtx.imageSmoothingQuality = 'high';
+  cropCtx.drawImage(frameCanvas, sx, sy, sw, sh, 0, 0, tw, th);
+  preprocessCrop(cropCtx, tw, th);
+  return cropCanvas;
+}
+
+// Grayscale (luminance) + contrast stretch on the raw pixels (CSS filters do
+// not affect getImageData, so this is done by hand).
+function preprocessCrop(ctx, w, h) {
   const img = ctx.getImageData(0, 0, w, h);
   const d = img.data;
-  const n = w * h;
-
-  // 1. Grayscale (luminance)
-  const gray = new Float32Array(n);
-  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
-    gray[p] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-  }
-
-  // 2. 3×3 Gaussian blur (kernel [1 2 1; 2 4 2; 1 2 1] / 16), edges clamped
-  const blur = new Float32Array(n);
-  const gk = [1, 2, 1, 2, 4, 2, 1, 2, 1];
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      let sum = 0, ki = 0;
-      for (let ky = -1; ky <= 1; ky++) {
-        const yy = y + ky < 0 ? 0 : y + ky >= h ? h - 1 : y + ky;
-        for (let kx = -1; kx <= 1; kx++) {
-          const xx = x + kx < 0 ? 0 : x + kx >= w ? w - 1 : x + kx;
-          sum += gray[yy * w + xx] * gk[ki++];
-        }
-      }
-      blur[y * w + x] = sum / 16;
-    }
-  }
-
-  // 3. Adaptive threshold using a local mean computed from a summed-area table
-  //    (O(n) regardless of window size). A pixel becomes white when it is
-  //    brighter than its local mean minus a small bias C.
-  const W1 = w + 1;
-  const sat = new Float64Array(W1 * (h + 1));
-  for (let y = 1; y <= h; y++) {
-    let rowSum = 0;
-    for (let x = 1; x <= w; x++) {
-      rowSum += blur[(y - 1) * w + (x - 1)];
-      sat[y * W1 + x] = sat[(y - 1) * W1 + x] + rowSum;
-    }
-  }
-  const R = Math.max(7, Math.round(Math.min(w, h) * 0.04));  // local window radius
-  const C = 8;                                               // bias below local mean
-  const bw = new Float32Array(n);
-  for (let y = 0; y < h; y++) {
-    const y0 = y - R < 0 ? 0 : y - R;
-    const y1 = y + R >= h ? h - 1 : y + R;
-    for (let x = 0; x < w; x++) {
-      const x0 = x - R < 0 ? 0 : x - R;
-      const x1 = x + R >= w ? w - 1 : x + R;
-      const area = (x1 - x0 + 1) * (y1 - y0 + 1);
-      const sum = sat[(y1 + 1) * W1 + (x1 + 1)]
-                - sat[y0 * W1 + (x1 + 1)]
-                - sat[(y1 + 1) * W1 + x0]
-                + sat[y0 * W1 + x0];
-      bw[y * w + x] = blur[y * w + x] > (sum / area - C) ? 255 : 0;
-    }
-  }
-
-  // 4. Contrast stretch — find min/max and stretch them to 0 and 255
   let mn = 255, mx = 0;
-  for (let p = 0; p < n; p++) {
-    const v = bw[p];
-    if (v < mn) mn = v;
-    if (v > mx) mx = v;
+  for (let i = 0; i < d.length; i += 4) {
+    const g = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    d[i] = d[i + 1] = d[i + 2] = g;
+    if (g < mn) mn = g;
+    if (g > mx) mx = g;
   }
   const range = (mx - mn) || 1;
-  for (let p = 0; p < n; p++) {
-    const v = ((bw[p] - mn) / range) * 255;
-    const o = p * 4;
-    d[o] = d[o + 1] = d[o + 2] = v;
-    d[o + 3] = 255;
+  for (let i = 0; i < d.length; i += 4) {
+    const v = ((d[i] - mn) / range) * 255;
+    d[i] = d[i + 1] = d[i + 2] = v;
   }
-
   ctx.putImageData(img, 0, 0);
 }
 
-// Mirror the canvas Tesseract receives into the on-screen preview window.
+// Mirror the crop Tesseract receives into the on-screen preview window.
 function updatePreview(srcCanvas) {
   const pw = 150;
   const ph = Math.max(1, Math.round(srcCanvas.height * (pw / srcCanvas.width)));
@@ -997,75 +1226,39 @@ function updatePreview(srcCanvas) {
   previewCtx.drawImage(srcCanvas, 0, 0, pw, ph);
 }
 
-async function scanFrame() {
-  if (ocrBusy || !tessWorker || !cameraReady) return;
-  if (videoEl.readyState < 2 || videoEl.paused || videoEl.videoWidth === 0) return;
-
-  ocrBusy = true;          // skip overlapping frames while OCR is still running
-  pulseDot();
-
+// Run Tesseract on the cropped plate region and apply all validation rules.
+async function runOcrOnBox(box) {
+  ocrBusy = true;
   try {
-    const vw = videoEl.videoWidth;
-    const vh = videoEl.videoHeight;
-    // FULL FRAME — nothing is cropped. The entire camera image is processed so
-    // a plate is detected wherever it appears. We only downscale for processing
-    // speed; the whole frame is preserved (this is a scale, not a crop).
-    const maxW = 960;
-    const workScale = Math.min(1, maxW / vw);
-    const cw = Math.round(vw * workScale);
-    const ch = Math.round(vh * workScale);
-    captureCanvas.width = cw;
-    captureCanvas.height = ch;
-    const ctx = captureCanvas.getContext('2d', { willReadFrequently: true });
-    ctx.drawImage(videoEl, 0, 0, cw, ch);
+    const crop = buildCrop(box);
+    updatePreview(crop);
+    const yoloPct = Math.round(box.score * 100);
 
-    // Grayscale → Gaussian blur → adaptive threshold → contrast stretch.
-    preprocessCanvas(ctx, cw, ch);
-
-    // Final pipeline step: scale up to at least 600px wide before OCR.
-    let sendCanvas = captureCanvas;
-    if (cw < 600) {
-      const up = 600 / cw;
-      ocrCanvas.width = Math.round(cw * up);
-      ocrCanvas.height = Math.round(ch * up);
-      ocrCtx.imageSmoothingEnabled = true;
-      ocrCtx.drawImage(captureCanvas, 0, 0, ocrCanvas.width, ocrCanvas.height);
-      sendCanvas = ocrCanvas;
-    }
-
-    // Show exactly what Tesseract is working with.
-    updatePreview(sendCanvas);
-
-    // Every recognize() is wrapped: if it throws, show the FULL error in the
-    // debug log instead of silently dropping the frame.
     let text = '', conf = 0;
     try {
-      const result = await tessWorker.recognize(sendCanvas);
-      text = (result && result.data && result.data.text) || '';
-      conf = (result && result.data && typeof result.data.confidence === 'number')
-        ? result.data.confidence : 0;
+      const r = await tessWorker.recognize(crop);
+      text = (r && r.data && r.data.text) || '';
+      conf = (r && r.data && typeof r.data.confidence === 'number') ? r.data.confidence : 0;
     } catch (err) {
-      const msg = (err && (err.message || err.toString())) || 'unknown error';
-      pushOcrLog('error', 'scan failed', escapeHtml(msg));
-      return;                            // finally still clears ocrBusy
-    }
-
-    // Always log SOMETHING for every attempt, even an empty read.
-    if (!text.trim()) {
-      pushOcrLog('reject', 'empty result', 'no text returned', conf);
+      pushScanLog({ error: 'OCR: ' + escapeHtml(String((err && err.message) || err)) });
       return;
     }
 
-    // Reject low-confidence reads outright, before any character validation.
+    const rawClean = text.replace(/\s+/g, ' ').trim();
+
+    // Empty read.
+    if (!rawClean) {
+      pushScanLog({ yoloFound: true, yoloConf: yoloPct, raw: '', accepted: false, reason: 'no text returned', tessConf: conf });
+      return;
+    }
+    // Reject low-confidence reads before character validation.
     if (conf < 40) {
-      const clean = escapeHtml(text.replace(/\s+/g, ' ').trim() || '(nothing)');
-      pushOcrLog('reject', clean, 'confidence < 40%', conf);
+      pushScanLog({ yoloFound: true, yoloConf: yoloPct, raw: escapeHtml(rawClean), accepted: false, reason: 'confidence < 40%', tessConf: conf });
       return;
     }
 
-    // Apply common-misread character corrections, then build candidates: each
-    // whitespace-separated chunk plus the whole string, cleaned to A–Z0–9.
-    // Accept the first one that passes validation.
+    // Character corrections, then candidates: each whitespace chunk + the whole
+    // string, cleaned to A–Z0–9. Accept the first that validates.
     const corrected = correctChars(text);
     const chunks = corrected.split(/\s+/).map(cleanPlate).filter(Boolean);
     const whole = cleanPlate(corrected);
@@ -1078,47 +1271,91 @@ async function scanFrame() {
       const last = recentReads[matched] || 0;
       const countedRecently = (now - last) < 10000;   // same plate within 10s
 
-      // Pause auto-scanning briefly so the same plate isn't grabbed twice.
-      scanPausedUntil = now + 2000;
+      scanPausedUntil = now + 2000;                    // pause auto-scan after a hit
 
-      pushOcrLog('ok', escapeHtml(matched),
-        countedRecently ? 'seen &lt;10s ago — not re-counted' : '', conf);
+      pushScanLog({
+        yoloFound: true, yoloConf: yoloPct, raw: escapeHtml(matched),
+        accepted: true, tessConf: conf,
+        reason: countedRecently ? 'seen &lt;10s ago — not re-counted' : ''
+      });
       lastDetectedDiv.style.display = 'block';
       lastDetectedPlateEl.textContent = matched;
 
       if (!countedRecently) {
-        recentReads[matched] = now;                  // remember when we counted it
+        recentReads[matched] = now;                    // remember when we counted it
         const isNew = recordPlate(matched);
         showToast(isNew ? `New plate: ${matched}` : `Updated: ${matched}`);
         if (currentTab === 'log') renderLog();
       }
     } else {
-      // Log the raw read and why the best-looking candidate was rejected.
       const best = [whole, ...chunks].sort((a, b) => b.length - a.length)[0] || '';
       const reason = best ? validatePlate(best).reason : 'nothing readable';
-      const clean = escapeHtml(text.replace(/\s+/g, ' ').trim() || '(nothing)');
-      pushOcrLog('reject', clean, reason, conf);
+      pushScanLog({ yoloFound: true, yoloConf: yoloPct, raw: escapeHtml(rawClean), accepted: false, reason, tessConf: conf });
     }
-  } catch (err) {
-    const msg = (err && (err.message || err.toString())) || 'unknown error';
-    pushOcrLog('error', 'scan failed', escapeHtml(msg));
   } finally {
     ocrBusy = false;
   }
 }
 
-// Manual capture — force an OCR pass at any moment
-captureBtn.addEventListener('click', () => {
-  if (!cameraReady) { showToast('Camera not ready yet'); return; }
-  if (!tessWorker) { showToast('OCR not ready yet'); return; }
-  if (ocrBusy) { showToast('Already scanning…'); return; }
-  scanFrame();
-});
+// ─────────────────────────────────────────────────────────────
+// Scan loop — YOLO runs frequently (live box); OCR fires every 3s
+// ─────────────────────────────────────────────────────────────
+function pulseDot() {
+  scanDot.classList.remove('pulse');
+  void scanDot.offsetWidth;
+  scanDot.classList.add('pulse');
+}
 
-// Retry OCR initialization after a failure (shown on the scan screen).
-document.getElementById('ocr-retry-btn').addEventListener('click', () => {
-  if (!ocrInitializing && !tessWorker) initOCR();
-});
+function startDetectLoop() {
+  if (detectInterval) return;
+  detectInterval = setInterval(detectTick, 600);
+}
+
+async function detectTick() {
+  if (detecting) return;                              // lock: skip if still running
+  if (!enginesReady || !cameraReady) return;
+  if (currentTab !== 'scan' || document.hidden) return;
+  if (videoEl.readyState < 2 || videoEl.paused || !videoEl.videoWidth) return;
+
+  detecting = true;
+  try {
+    // Is an OCR scan due? (3s cadence, not within the post-hit pause, not busy)
+    const scanDue = (Date.now() - lastOcrAt >= 3000) && (Date.now() >= scanPausedUntil) && !ocrBusy;
+
+    const box = await runDetection();                 // always updates the live box
+
+    if (scanDue) {
+      lastOcrAt = Date.now();
+      pulseDot();
+      if (box) await runOcrOnBox(box);
+      else pushScanLog({ yoloFound: false });         // no plate this frame → skip OCR
+    }
+  } catch (err) {
+    pushScanLog({ error: escapeHtml(String((err && err.message) || err)) });
+  } finally {
+    detecting = false;
+  }
+}
+
+// Manual capture — force a detection + OCR pass right now.
+async function manualScan() {
+  if (!enginesReady) { showToast('Still loading…'); return; }
+  if (!cameraReady) { showToast('Camera not ready yet'); return; }
+  if (detecting || ocrBusy) { showToast('Already scanning…'); return; }
+  detecting = true;
+  try {
+    pulseDot();
+    const box = await runDetection();
+    lastOcrAt = Date.now();
+    if (box) await runOcrOnBox(box);
+    else pushScanLog({ yoloFound: false });
+  } catch (err) {
+    pushScanLog({ error: escapeHtml(String((err && err.message) || err)) });
+  } finally {
+    detecting = false;
+  }
+}
+captureBtn.addEventListener('click', manualScan);
 
 // ─────────────────────────────────────────────────────────────
 // Tab navigation
@@ -1374,11 +1611,12 @@ document.getElementById('wl-add-btn').addEventListener('click', () => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// Boot
+// Boot — start the camera and initialize both ML engines in parallel.
+// The loading screen stays up until BOTH the model and OCR are ready.
 // ─────────────────────────────────────────────────────────────
-async function boot() {
-  const ok = await startCamera();
-  if (ok) await initOCR();
+function boot() {
+  startCamera();        // async; manages its own UI (camera-error overlay)
+  initEngines();        // shows progress; hides the loading screen when ready
 }
 boot();
 </script>
